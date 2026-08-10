@@ -87,10 +87,6 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
     for period in ema_periods:
         data[f"EMA {period}"] = close.ewm(span=period, adjust=False).mean()
 
-    # Find an explicit exit clause; otherwise use the same crossover in reverse.
-    # "close" is also a price field ("close crosses above...") and must not
-    # be mistaken for an exit command. Treat it as a command only in phrases
-    # such as "close when..." or "close the position...".
     exit_words = re.search(r"\b(?:exit|sell|short)\b\s*(?:when|if|on)?\s*(.*)$", raw)
     if exit_words is None:
         exit_words = re.search(r"\bclose\s+(?:(?:the\s+)?(?:position|trade)|when|if)\s*(.*)$", raw)
@@ -98,7 +94,6 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
     exit_clause = exit_words.group(1) if exit_words else ""
 
     def moving_average_signals(clause: str) -> tuple[Optional[pd.Series], list[str]]:
-        """Parse one or more MA conditions, joined with OR."""
         pattern = re.compile(
             r"(?:(?P<relation>cross(?:es|ing)?\s+above|cross(?:es|ing)?\s+below|above|over|below|under|at|near|touch(?:es)?)\s+(?:the\s+)?)*"
             r"(?:(?P<kind>sma|ema|simple moving average|exponential moving average)[ -]?(?P<period>\d+)|"
@@ -111,16 +106,12 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
             kind = (match.group("kind") or match.group("kind2") or "sma").lower()
             period = int(match.group("period") or match.group("period2"))
             unit = (match.group("unit") or "day").lower()
-            # A weekly average is represented on the daily series by roughly five
-            # trading sessions per week.
             daily_period = period * 5 if unit.startswith("week") else period
             is_ema = "ema" in kind or "exponential" in kind
             key = f"{'EMA' if is_ema else 'SMA'} {daily_period}"
             if key not in data:
                 data[key] = close.ewm(span=daily_period, adjust=False).mean() if is_ema else close.rolling(daily_period).mean()
             average = data[key]
-            # In "200-day moving average or 200-week moving average", the
-            # second average inherits the first one's "at" relationship.
             relation = (match.group("relation") or "at").lower()
             if relation in {"at", "near", "touch", "touches"}:
                 signal = (data["Low"] <= average) & (data["High"] >= average)
@@ -167,8 +158,6 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
         if key not in data:
             data[key] = close.rolling(period).mean()
         enter, enter_desc = crossover(close, data[key]), f"Close crosses above {key} (default)"
-    # An ATR-only exit is intentionally a price-based exit with no indicator
-    # signal; do not replace it with the default SMA 50 exit.
     if leave is None and not re.search(r"\batr\b|average true range", exit_clause):
         period = number_in(raw, r"(?:sma|simple moving average)[ -]?(\d+)", 50)
         key = f"SMA {period}"
@@ -231,7 +220,14 @@ def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.Dat
             if strategy.exit.iloc[i] or timed or risk or target or atr_risk or atr_target or i == len(data) - 1:
                 exit_price = current if i == len(data) - 1 else float(data["Open"].iloc[i + 1])
                 result = exit_price / entry_price - 1
-                trades.append({"Entry": entry_date, "Exit": data.index[i] if i == len(data) - 1 else data.index[i + 1], "Entry price": entry_price, "Exit price": exit_price, "Return": result})
+                trades.append({
+                    "Entry": entry_date, 
+                    "Exit": data.index[i] if i == len(data) - 1 else data.index[i + 1], 
+                    "Entry price": entry_price, 
+                    "Exit price": exit_price, 
+                    "Return": result,
+                    "Outcome": "Win" if result > 0 else "Loss"
+                })
                 equity.iloc[i:] *= 1 + result
                 position = None
     if trades:
@@ -241,7 +237,7 @@ def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.Dat
         win_rate = wins / len(trade_frame)
         total_return = float(equity.iloc[-1] - 1)
     else:
-        trade_frame = pd.DataFrame(columns=["Entry", "Exit", "Entry price", "Exit price", "Return"])
+        trade_frame = pd.DataFrame(columns=["Entry", "Exit", "Entry price", "Exit price", "Return", "Outcome"])
         wins = losses = 0
         win_rate = total_return = 0.0
     curve = equity.ffill()
@@ -251,10 +247,51 @@ def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.Dat
 
 
 def price_chart(data: pd.DataFrame, trades: pd.DataFrame, symbol: str) -> go.Figure:
-    figure = go.Figure(go.Candlestick(x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"], name=symbol))
+    figure = go.Figure()
+
+    # Always ensure 200-day and 200-week SMAs are computed and added
+    close = data["Close"]
+    sma_200 = close.rolling(200).mean()
+    sma_200w = close.rolling(1000).mean()  # 200 weeks ~ 1000 trading sessions
+
+    figure.add_trace(go.Scatter(x=data.index, y=sma_200, mode="lines", name="200 SMA", line=dict(color="#FFD700", width=1.5)))
+    figure.add_trace(go.Scatter(x=data.index, y=sma_200w, mode="lines", name="200 WMA", line=dict(color="#FFD700", width=3.5)))
+
+    # Candlestick chart
+    figure.add_trace(go.Candlestick(x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"], name=symbol))
+
+    # Translucent TradingView-style performance regions & markers
     if not trades.empty:
-        figure.add_trace(go.Scatter(x=trades["Entry"], y=trades["Entry price"], mode="markers", name="Entry", marker=dict(symbol="triangle-up", size=11, color="#18c29c")))
-        figure.add_trace(go.Scatter(x=trades["Exit"], y=trades["Exit price"], mode="markers", name="Exit", marker=dict(symbol="triangle-down", size=11, color="#ff6b6b")))
+        for _, trade in trades.iterrows():
+            entry_x, exit_x = trade["Entry"], trade["Exit"]
+            entry_p, exit_p = trade["Entry price"], trade["Exit price"]
+            is_win = trade["Return"] > 0
+            
+            # Shaded region between entry and exit
+            fill_color = "rgba(0, 230, 118, 0.15)" if is_win else "rgba(255, 82, 82, 0.15)"
+            
+            # Add a filled rectangular polygon boundary for the trade duration
+            figure.add_shape(
+                type="rect",
+                x0=entry_x, x1=exit_x,
+                y0=min(entry_p, exit_p), y1=max(entry_p, exit_p),
+                fillcolor=fill_color,
+                layer="below",
+                line=dict(width=0),
+            )
+
+        # Prominent Entry and Exit arrows
+        wins_df = trades[trades["Return"] > 0]
+        losses_df = trades[trades["Return"] <= 0]
+
+        if not wins_df.empty:
+            figure.add_trace(go.Scatter(x=wins_df["Entry"], y=wins_df["Entry price"], mode="markers", name="Long Entry (Win)", marker=dict(symbol="triangle-up", size=13, color="#00E676", line=dict(width=1, color="#000"))))
+            figure.add_trace(go.Scatter(x=wins_df["Exit"], y=wins_df["Exit price"], mode="markers", name="Target Exit", marker=dict(symbol="triangle-down", size=13, color="#00E676", line=dict(width=1, color="#000"))))
+
+        if not losses_df.empty:
+            figure.add_trace(go.Scatter(x=losses_df["Entry"], y=losses_df["Entry price"], mode="markers", name="Long Entry (Loss)", marker=dict(symbol="triangle-up", size=13, color="#FF5252", line=dict(width=1, color="#000"))))
+            figure.add_trace(go.Scatter(x=losses_df["Exit"], y=losses_df["Exit price"], mode="markers", name="Stop Loss Exit", marker=dict(symbol="triangle-down", size=13, color="#FF5252", line=dict(width=1, color="#000"))))
+
     figure.update_layout(height=560, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02))
     return figure
 
@@ -309,7 +346,7 @@ st.plotly_chart(price_chart(market_data, trades, ticker), use_container_width=Tr
 if trades.empty:
     st.info("No trades matched the strategy in this period. Try a shorter moving average or different RSI thresholds.")
 else:
-    display_trades = trades.copy()
+    display_trades = trades.drop(columns=["Outcome"]).copy()
     display_trades["Return"] = display_trades["Return"].map(lambda value: f"{value:+.2%}")
     st.subheader("Trade log")
     st.dataframe(display_trades, use_container_width=True, hide_index=True)
