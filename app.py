@@ -2696,11 +2696,7 @@ if show_screener:
                 available_symbols,
                 key="selected_screen_symbol",
                 format_func=lambda symbol: (
-                    f"{symbol} — "
-                    f"{screened.loc["
-                        screened['Symbol'] == symbol,
-                        'Company'
-                    ].iloc[0]}"
+                f"{symbol} — {screened.loc[screened['Symbol'] == symbol, 'Company'].iloc[0]}"
                 ),
             )
 
