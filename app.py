@@ -1109,38 +1109,87 @@ def get_sp500_constituents() -> pd.DataFrame:
     """Load the current S&P 500 constituents."""
 
     url = (
-        "https://en.wikipedia.org/wiki/"
-        "List_of_S%26P_500_companies"
+        "https://raw.githubusercontent.com/datasets/"
+        "s-and-p-500-companies/main/data/constituents.csv"
     )
 
-    tables = pd.read_html(url)
-
-    if not tables:
+    try:
+        constituents = pd.read_csv(url)
+    except Exception as exc:
         raise ValueError(
-            "Could not load the S&P 500 constituent list."
+            f"Could not load the S&P 500 constituent list: {exc}"
+        ) from exc
+
+    # Normalize the column names expected by the screener.
+    rename_map = {
+        "Symbol": "Symbol",
+        "Name": "Security",
+        "Security": "Security",
+        "Sector": "GICS Sector",
+        "GICS Sector": "GICS Sector",
+    }
+
+    constituents = constituents.rename(columns=rename_map)
+
+    required_columns = [
+        "Symbol",
+        "Security",
+        "GICS Sector",
+    ]
+
+    missing = [
+        column
+        for column in required_columns
+        if column not in constituents.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "S&P 500 constituent data is missing: "
+            + ", ".join(missing)
         )
 
-    constituents = tables[0][
-        [
-            "Symbol",
-            "Security",
-            "GICS Sector",
-        ]
+    constituents = constituents[
+        required_columns
     ].copy()
 
+    # Yahoo Finance uses "-" instead of "." for tickers
+    # such as BRK.B -> BRK-B.
     constituents["Symbol"] = (
         constituents["Symbol"]
         .astype(str)
-        .str.replace(
-            ".",
-            "-",
-            regex=False,
-        )
+        .str.replace(".", "-", regex=False)
         .str.strip()
     )
 
-    return constituents
+    constituents["Security"] = (
+        constituents["Security"]
+        .astype(str)
+        .str.strip()
+    )
 
+    constituents["GICS Sector"] = (
+        constituents["GICS Sector"]
+        .astype(str)
+        .str.strip()
+    )
+
+    constituents = (
+        constituents
+        .dropna(subset=["Symbol"])
+        .drop_duplicates(subset=["Symbol"])
+        .sort_values("Symbol")
+        .reset_index(drop=True)
+    )
+
+    if len(constituents) < 450:
+        raise ValueError(
+            f"Only {len(constituents)} S&P 500 constituents "
+            "were loaded. The data source may be unavailable "
+            "or incomplete."
+        )
+
+    return constituents
 
 # ============================================================
 # INSIDER ACTIVITY
