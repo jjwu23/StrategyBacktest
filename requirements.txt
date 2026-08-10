@@ -3,3 +3,4 @@ yfinance>=0.2.40,<1
 plotly>=5.22,<7
 pandas>=2.0,<3
 numpy>=1.24,<3
+lxml
