@@ -67,6 +67,9 @@ class ParsedStrategy:
     max_hold_days: Optional[int]
     stop_loss: Optional[float]
     take_profit: Optional[float]
+    atr_profit: Optional[float]
+    atr_loss: Optional[float]
+    atr_period: int
 
 
 def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
@@ -85,29 +88,63 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
         data[f"EMA {period}"] = close.ewm(span=period, adjust=False).mean()
 
     # Find an explicit exit clause; otherwise use the same crossover in reverse.
-    exit_words = re.search(r"(?:exit|sell|close|short)\s+(?:when|if|on)?\s*(.*)$", raw)
+    # "close" is also a price field ("close crosses above...") and must not
+    # be mistaken for an exit command. Treat it as a command only in phrases
+    # such as "close when..." or "close the position...".
+    exit_words = re.search(r"\b(?:exit|sell|short)\b\s*(?:when|if|on)?\s*(.*)$", raw)
+    if exit_words is None:
+        exit_words = re.search(r"\bclose\s+(?:(?:the\s+)?(?:position|trade)|when|if)\s*(.*)$", raw)
     entry_clause = raw[: exit_words.start()] if exit_words else raw
     exit_clause = exit_words.group(1) if exit_words else ""
 
-    def crossover_signal(clause: str, direction: str) -> tuple[pd.Series, Optional[str]]:
-        ma = re.search(
-            r"(?:above|over|below|under|cross(?:es|ing)?\s+(?:above|below))\s+(?:the\s+)?(?:(sma|ema|simple moving average|exponential moving average)[ -]?(\d+)|(\d+)[ -]?(?:day|days?)[ -]?(sma|ema|simple moving average|exponential moving average))",
-            clause,
+    def moving_average_signals(clause: str) -> tuple[Optional[pd.Series], list[str]]:
+        """Parse one or more MA conditions, joined with OR."""
+        pattern = re.compile(
+            r"(?:(?P<relation>cross(?:es|ing)?\s+above|cross(?:es|ing)?\s+below|above|over|below|under|at|near|touch(?:es)?)\s+(?:the\s+)?)*"
+            r"(?:(?P<kind>sma|ema|simple moving average|exponential moving average)[ -]?(?P<period>\d+)|"
+            r"(?P<period2>\d+)[ -]?(?P<unit>day|days|week|weeks)[ -]?(?P<kind2>sma|ema|moving average|ma))",
+            flags=re.I,
         )
-        if not ma:
-            return None, None
-        kind = ma.group(1) or ma.group(4)
-        period = int(ma.group(2) or ma.group(3))
-        key = f"{'SMA' if 'sma' in kind or 'simple' in kind else 'EMA'} {period}"
-        if key not in data:
-            data[key] = close.rolling(period).mean() if key.startswith("SMA") else close.ewm(span=period, adjust=False).mean()
-        series = data[key]
-        above = any(word in clause for word in ["above", "over"]) and "below" not in clause
-        signal = crossover(close, series) if above else crossunder(close, series)
-        return signal, f"Close crosses {'above' if above else 'below'} {key}"
+        signals = []
+        labels = []
+        for match in pattern.finditer(clause):
+            kind = (match.group("kind") or match.group("kind2") or "sma").lower()
+            period = int(match.group("period") or match.group("period2"))
+            unit = (match.group("unit") or "day").lower()
+            # A weekly average is represented on the daily series by roughly five
+            # trading sessions per week.
+            daily_period = period * 5 if unit.startswith("week") else period
+            is_ema = "ema" in kind or "exponential" in kind
+            key = f"{'EMA' if is_ema else 'SMA'} {daily_period}"
+            if key not in data:
+                data[key] = close.ewm(span=daily_period, adjust=False).mean() if is_ema else close.rolling(daily_period).mean()
+            average = data[key]
+            # In "200-day moving average or 200-week moving average", the
+            # second average inherits the first one's "at" relationship.
+            relation = (match.group("relation") or "at").lower()
+            if relation in {"at", "near", "touch", "touches"}:
+                signal = (data["Low"] <= average) & (data["High"] >= average)
+                action = "touches"
+            elif "below" in relation or relation in {"under"}:
+                signal = crossunder(close, average)
+                action = "crosses below"
+            else:
+                signal = crossover(close, average)
+                action = "crosses above"
+            signals.append(signal.fillna(False))
+            original_period = f"{period}-{unit.rstrip('s')}"
+            labels.append(f"Close {action} {original_period} {'EMA' if is_ema else 'moving average'}")
+        if not signals:
+            return None, []
+        combined = signals[0]
+        for signal in signals[1:]:
+            combined |= signal
+        return combined, labels
 
-    enter, enter_desc = crossover_signal(entry_clause, "entry")
-    leave, leave_desc = crossover_signal(exit_clause, "exit") if exit_clause else (None, None)
+    enter, enter_labels = moving_average_signals(entry_clause)
+    leave, leave_labels = moving_average_signals(exit_clause) if exit_clause else (None, [])
+    enter_desc = " or ".join(enter_labels) if enter_labels else None
+    leave_desc = " or ".join(leave_labels) if leave_labels else None
 
     entry_rsi = re.search(r"rsi(?:\s*\(?\s*(\d+)\s*\)?)?\s*(?:is\s*)?(below|under|less than|above|over|greater than)\s*(\d+)", entry_clause)
     exit_rsi = re.search(r"rsi(?:\s*\(?\s*(\d+)\s*\)?)?\s*(?:is\s*)?(below|under|less than|above|over|greater than)\s*(\d+)", exit_clause)
@@ -130,12 +167,16 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
         if key not in data:
             data[key] = close.rolling(period).mean()
         enter, enter_desc = crossover(close, data[key]), f"Close crosses above {key} (default)"
-    if leave is None:
+    # An ATR-only exit is intentionally a price-based exit with no indicator
+    # signal; do not replace it with the default SMA 50 exit.
+    if leave is None and not re.search(r"\batr\b|average true range", exit_clause):
         period = number_in(raw, r"(?:sma|simple moving average)[ -]?(\d+)", 50)
         key = f"SMA {period}"
         if key not in data:
             data[key] = close.rolling(period).mean()
         leave, leave_desc = crossunder(close, data[key]), f"Close crosses below {key} (default)"
+    elif leave is None:
+        leave, leave_desc = pd.Series(False, index=data.index), "ATR thresholds"
     descriptions.extend([f"Enter: {enter_desc}", f"Exit: {leave_desc}"])
 
     volume_match = re.search(r"volume\s+(?:is\s+)?(?:above|over|greater than)\s+(?:its\s+)?(?:average|avg)(?:\s+volume)?(?:\s+(\d+)[ -]?day)?", raw)
@@ -147,13 +188,19 @@ def parse_strategy(text: str, data: pd.DataFrame) -> ParsedStrategy:
     hold_match = re.search(r"(?:hold|exit after|sell after)\s+(\d+)\s+days?", raw)
     stop_match = re.search(r"(?:stop loss|stop-loss)\s*(?:at|of)?\s*(\d+(?:\.\d+)?)\s*%", raw)
     profit_match = re.search(r"(?:take profit|profit target)\s*(?:at|of)?\s*(\d+(?:\.\d+)?)\s*%", raw)
+    atr_matches = re.findall(r"([+-]?)\s*(\d+(?:\.\d+)?)\s*atr(?:\s*\(?\s*(win|loss|profit|target|stop)\s*\)?)?", exit_clause)
+    atr_profit = next((float(value) for sign, value, label in atr_matches if sign == "+" or label in {"win", "profit", "target"}), None)
+    atr_loss = next((float(value) for sign, value, label in atr_matches if sign == "-" or label in {"loss", "stop"}), None)
+    atr_period = number_in(raw, r"(?:atr|average true range)\s*\(?\s*(\d+)\s*\)?", 14)
     max_hold = int(hold_match.group(1)) if hold_match else None
     stop_loss = float(stop_match.group(1)) / 100 if stop_match else None
     take_profit = float(profit_match.group(1)) / 100 if profit_match else None
     if max_hold: descriptions.append(f"Time exit: {max_hold} trading days")
     if stop_loss: descriptions.append(f"Risk exit: {stop_loss:.1%} stop loss")
     if take_profit: descriptions.append(f"Profit exit: {take_profit:.1%} take profit")
-    return ParsedStrategy(enter.fillna(False), leave.fillna(False), descriptions, max_hold, stop_loss, take_profit)
+    if atr_profit is not None: descriptions.append(f"ATR profit exit: +{atr_profit:g} × ATR({atr_period})")
+    if atr_loss is not None: descriptions.append(f"ATR loss exit: -{atr_loss:g} × ATR({atr_period})")
+    return ParsedStrategy(enter.fillna(False), leave.fillna(False), descriptions, max_hold, stop_loss, take_profit, atr_profit, atr_loss, atr_period)
 
 
 def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.DataFrame]:
@@ -163,6 +210,11 @@ def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.Dat
     entry_price = None
     entry_date = None
     days_held = 0
+    true_range = pd.concat(
+        [data["High"] - data["Low"], (data["High"] - data["Close"].shift()).abs(), (data["Low"] - data["Close"].shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.rolling(strategy.atr_period).mean()
     for i in range(len(data)):
         if position is None and i < len(data) - 1 and strategy.entry.iloc[i]:
             position, entry_price, entry_date, days_held = i + 1, float(data["Open"].iloc[i + 1]), data.index[i + 1], 0
@@ -170,10 +222,13 @@ def backtest(data: pd.DataFrame, strategy: ParsedStrategy) -> tuple[dict, pd.Dat
             days_held += 1
             current = float(data["Close"].iloc[i])
             pnl = current / entry_price - 1
+            current_atr = float(atr.iloc[i]) if pd.notna(atr.iloc[i]) else 0.0
             timed = strategy.max_hold_days is not None and days_held >= strategy.max_hold_days
             risk = strategy.stop_loss is not None and pnl <= -strategy.stop_loss
             target = strategy.take_profit is not None and pnl >= strategy.take_profit
-            if strategy.exit.iloc[i] or timed or risk or target or i == len(data) - 1:
+            atr_risk = strategy.atr_loss is not None and current_atr > 0 and current <= entry_price - strategy.atr_loss * current_atr
+            atr_target = strategy.atr_profit is not None and current_atr > 0 and current >= entry_price + strategy.atr_profit * current_atr
+            if strategy.exit.iloc[i] or timed or risk or target or atr_risk or atr_target or i == len(data) - 1:
                 exit_price = current if i == len(data) - 1 else float(data["Open"].iloc[i + 1])
                 result = exit_price / entry_price - 1
                 trades.append({"Entry": entry_date, "Exit": data.index[i] if i == len(data) - 1 else data.index[i + 1], "Entry price": entry_price, "Exit price": exit_price, "Return": result})
