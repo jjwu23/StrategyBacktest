@@ -2,18 +2,44 @@
 
 from __future__ import annotations
 
+import os
 import re
+import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from io import StringIO
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
+SEC_HEADERS = {
+    "User-Agent": os.getenv(
+        "SEC_USER_AGENT",
+        "Signal Lab research contact@example.com",
+    ),
+    "Accept-Encoding": "gzip, deflate",
+}
+
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+SEC_COMPANY_TICKERS_URL = (
+    "https://www.sec.gov/files/company_tickers_exchange.json"
+)
+
+PURCHASE_CODES = {"P", "P4"}
+SALE_CODES = {"S", "S4"}
+
+LONG_SCORE_MAX = 100
+SHORT_SCORE_MAX = 100
 
 st.set_page_config(
     page_title="Signal Lab",
@@ -908,190 +934,263 @@ def backtest(
 # PRICE CHART
 # ============================================================
 
-def price_chart(
+def signal_chart(
     data: pd.DataFrame,
-    trades: pd.DataFrame,
     symbol: str,
+    insider_transactions: Optional[pd.DataFrame] = None,
+    long_signals: Optional[pd.Series] = None,
+    short_signals: Optional[pd.Series] = None,
 ) -> go.Figure:
+
+    frame = add_technical_features(
+        data
+    )
 
     figure = go.Figure()
 
-    close = data["Close"]
+    # --------------------------------------------------------
+    # Candlesticks
+    # --------------------------------------------------------
 
-    sma_200 = close.rolling(200).mean()
+    figure.add_trace(
+        go.Candlestick(
+            x=frame.index,
+            open=frame["Open"],
+            high=frame["High"],
+            low=frame["Low"],
+            close=frame["Close"],
+            name=symbol,
+        )
+    )
 
-    sma_200w = close.rolling(
-        1000
-    ).mean()
+    # --------------------------------------------------------
+    # 8 EMA — cyan
+    # --------------------------------------------------------
 
     figure.add_trace(
         go.Scatter(
-            x=data.index,
-            y=sma_200,
+            x=frame.index,
+            y=frame["EMA 8"],
             mode="lines",
-            name="200 SMA",
+            name="8 EMA",
             line=dict(
-                color="#FFD700",
+                color="#00FFFF",
                 width=1.5,
             ),
         )
     )
 
+    # --------------------------------------------------------
+    # 20 EMA — orange
+    # --------------------------------------------------------
+
     figure.add_trace(
         go.Scatter(
-            x=data.index,
-            y=sma_200w,
+            x=frame.index,
+            y=frame["EMA 20"],
             mode="lines",
-            name="200 WMA",
+            name="20 EMA",
             line=dict(
-                color="#FFD700",
-                width=3.5,
+                color="#FF8C00",
+                width=1.8,
             ),
         )
     )
 
+    # --------------------------------------------------------
+    # 200 EMA — yellow
+    # --------------------------------------------------------
+
     figure.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data["Open"],
-            high=data["High"],
-            low=data["Low"],
-            close=data["Close"],
-            name=symbol,
+        go.Scatter(
+            x=frame.index,
+            y=frame["EMA 200"],
+            mode="lines",
+            name="200 EMA",
+            line=dict(
+                color="#FFD700",
+                width=2,
+            ),
         )
     )
 
-    if not trades.empty:
+    # --------------------------------------------------------
+    # 200 WEEK EMA — thick yellow
+    # --------------------------------------------------------
 
-        for _, trade in trades.iterrows():
+    figure.add_trace(
+        go.Scatter(
+            x=frame.index,
+            y=frame["EMA 200 Week"],
+            mode="lines",
+            name="200 Week EMA",
+            line=dict(
+                color="#FFD700",
+                width=4,
+            ),
+        )
+    )
 
-            entry_x = trade["Entry"]
-            exit_x = trade["Exit"]
+    # --------------------------------------------------------
+    # Insider purchases — purple dots
+    # --------------------------------------------------------
 
-            entry_p = trade["Entry price"]
-            exit_p = trade["Exit price"]
+    if (
+        insider_transactions is not None
+        and not insider_transactions.empty
+    ):
 
-            is_win = (
-                trade["Return"] > 0
+        insider = (
+            insider_transactions
+            .copy()
+        )
+
+        insider["Transaction Date"] = (
+            pd.to_datetime(
+                insider["Transaction Date"],
+                errors="coerce",
+            )
+        )
+
+        insider = insider.dropna(
+            subset=["Transaction Date"]
+        )
+
+        for _, row in insider.iterrows():
+
+            transaction_date = (
+                row["Transaction Date"]
             )
 
-            fill_color = (
-                "rgba(0, 230, 118, 0.15)"
-                if is_win
-                else "rgba(255, 82, 82, 0.15)"
+            matching_dates = frame.index[
+                frame.index.normalize()
+                == transaction_date.normalize()
+            ]
+
+            if len(matching_dates) == 0:
+                continue
+
+            chart_date = matching_dates[0]
+
+            # Price level is the actual
+            # Form 4 transaction price.
+            purchase_price = float(
+                row["Price"]
             )
 
-            figure.add_shape(
-                type="rect",
-                x0=entry_x,
-                x1=exit_x,
-                y0=min(
-                    entry_p,
-                    exit_p,
-                ),
-                y1=max(
-                    entry_p,
-                    exit_p,
-                ),
-                fillcolor=fill_color,
-                layer="below",
-                line=dict(width=0),
+            market_cap = np.nan
+
+            pct_market_cap = np.nan
+
+            figure.add_trace(
+                go.Scatter(
+                    x=[chart_date],
+                    y=[purchase_price],
+                    mode="markers",
+                    name="Insider Purchase",
+                    marker=dict(
+                        color="#B000FF",
+                        size=10,
+                        symbol="circle",
+                    ),
+                    customdata=[[
+                        row.get(
+                            "Insider",
+                            "Unknown",
+                        ),
+                        row.get(
+                            "Value",
+                            np.nan,
+                        ),
+                        pct_market_cap,
+                    ]],
+                    hovertemplate=(
+                        "<b>Insider Purchase</b><br>"
+                        "Insider: %{customdata[0]}<br>"
+                        "Price: $%{y:.2f}<br>"
+                        "Purchase Value: $%{customdata[1]:,.0f}"
+                        "<br>"
+                        "Market Cap: %{customdata[2]:.3%}"
+                        "<extra></extra>"
+                    ),
+                )
             )
 
-        wins_df = trades[
-            trades["Return"] > 0
+    # --------------------------------------------------------
+    # Long signals — green upward triangles
+    # --------------------------------------------------------
+
+    if long_signals is not None:
+
+        long_dates = frame.index[
+            long_signals.reindex(
+                frame.index,
+                fill_value=False,
+            )
         ]
 
-        losses_df = trades[
-            trades["Return"] <= 0
+        if len(long_dates):
+
+            figure.add_trace(
+                go.Scatter(
+                    x=long_dates,
+                    y=frame.loc[
+                        long_dates,
+                        "Low",
+                    ] * 0.985,
+                    mode="markers",
+                    name="Long Signal",
+                    marker=dict(
+                        symbol="triangle-up",
+                        color="#00E676",
+                        size=13,
+                    ),
+                )
+            )
+
+    # --------------------------------------------------------
+    # Short signals — red downward triangles
+    # --------------------------------------------------------
+
+    if short_signals is not None:
+
+        short_dates = frame.index[
+            short_signals.reindex(
+                frame.index,
+                fill_value=False,
+            )
         ]
 
-        if not wins_df.empty:
+        if len(short_dates):
 
             figure.add_trace(
                 go.Scatter(
-                    x=wins_df["Entry"],
-                    y=wins_df["Entry price"],
+                    x=short_dates,
+                    y=frame.loc[
+                        short_dates,
+                        "High",
+                    ] * 1.015,
                     mode="markers",
-                    name="Long Entry (Win)",
-                    marker=dict(
-                        symbol="triangle-up",
-                        size=13,
-                        color="#00E676",
-                        line=dict(
-                            width=1,
-                            color="#000",
-                        ),
-                    ),
-                )
-            )
-
-            figure.add_trace(
-                go.Scatter(
-                    x=wins_df["Exit"],
-                    y=wins_df["Exit price"],
-                    mode="markers",
-                    name="Target Exit",
+                    name="Short Signal",
                     marker=dict(
                         symbol="triangle-down",
-                        size=13,
-                        color="#00E676",
-                        line=dict(
-                            width=1,
-                            color="#000",
-                        ),
-                    ),
-                )
-            )
-
-        if not losses_df.empty:
-
-            figure.add_trace(
-                go.Scatter(
-                    x=losses_df["Entry"],
-                    y=losses_df["Entry price"],
-                    mode="markers",
-                    name="Long Entry (Loss)",
-                    marker=dict(
-                        symbol="triangle-up",
-                        size=13,
                         color="#FF5252",
-                        line=dict(
-                            width=1,
-                            color="#000",
-                        ),
-                    ),
-                )
-            )
-
-            figure.add_trace(
-                go.Scatter(
-                    x=losses_df["Exit"],
-                    y=losses_df["Exit price"],
-                    mode="markers",
-                    name="Stop Loss Exit",
-                    marker=dict(
-                        symbol="triangle-down",
                         size=13,
-                        color="#FF5252",
-                        line=dict(
-                            width=1,
-                            color="#000",
-                        ),
                     ),
                 )
             )
 
     figure.update_layout(
-        height=560,
+        height=700,
         template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
         margin=dict(
             l=10,
             r=10,
-            t=30,
+            t=35,
             b=10,
         ),
-        xaxis_rangeslider_visible=False,
         legend=dict(
             orientation="h",
             y=1.02,
@@ -1100,226 +1199,1242 @@ def price_chart(
 
     return figure
 
+
 # ============================================================
 # S&P 500 CONSTITUENTS
 # ============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_sp500_constituents() -> pd.DataFrame:
-    """Load the current S&P 500 constituents."""
+def get_us_listed_universe() -> pd.DataFrame:
+    """
+    Load U.S.-listed companies from SEC ticker/exchange data.
 
-    url = (
-        "https://raw.githubusercontent.com/datasets/"
-        "s-and-p-500-companies/main/data/constituents.csv"
+    Restrict the universe to NYSE and NASDAQ.
+    """
+
+    response = requests.get(
+        SEC_COMPANY_TICKERS_URL,
+        headers=SEC_HEADERS,
+        timeout=30,
     )
+    response.raise_for_status()
 
-    try:
-        constituents = pd.read_csv(url)
-    except Exception as exc:
+    payload = response.json()
+
+    if "data" not in payload:
         raise ValueError(
-            f"Could not load the S&P 500 constituent list: {exc}"
-        ) from exc
-
-    # Normalize the column names expected by the screener.
-    rename_map = {
-        "Symbol": "Symbol",
-        "Name": "Security",
-        "Security": "Security",
-        "Sector": "GICS Sector",
-        "GICS Sector": "GICS Sector",
-    }
-
-    constituents = constituents.rename(columns=rename_map)
-
-    required_columns = [
-        "Symbol",
-        "Security",
-        "GICS Sector",
-    ]
-
-    missing = [
-        column
-        for column in required_columns
-        if column not in constituents.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            "S&P 500 constituent data is missing: "
-            + ", ".join(missing)
+            "SEC ticker/exchange file did not contain data."
         )
 
-    constituents = constituents[
-        required_columns
+    frame = pd.DataFrame(
+        payload["data"],
+        columns=[
+            "CIK",
+            "Symbol",
+            "Company",
+            "Exchange",
+        ],
+    )
+
+    frame["Symbol"] = (
+        frame["Symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(".", "-", regex=False)
+    )
+
+    frame["Company"] = (
+        frame["Company"]
+        .astype(str)
+        .str.strip()
+    )
+
+    frame["Exchange"] = (
+        frame["Exchange"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    frame["CIK"] = (
+        pd.to_numeric(
+            frame["CIK"],
+            errors="coerce",
+        )
+        .astype("Int64")
+    )
+
+    frame = frame[
+        frame["Exchange"].isin(
+            ["NYSE", "NASDAQ"]
+        )
     ].copy()
 
-    # Yahoo Finance uses "-" instead of "." for tickers
-    # such as BRK.B -> BRK-B.
-    constituents["Symbol"] = (
-        constituents["Symbol"]
-        .astype(str)
-        .str.replace(".", "-", regex=False)
-        .str.strip()
+    # Remove obvious non-operating securities.
+    excluded = frame["Symbol"].str.contains(
+        r"[\^/]",
+        regex=True,
+        na=False,
     )
 
-    constituents["Security"] = (
-        constituents["Security"]
-        .astype(str)
-        .str.strip()
-    )
+    frame = frame.loc[~excluded]
 
-    constituents["GICS Sector"] = (
-        constituents["GICS Sector"]
-        .astype(str)
-        .str.strip()
-    )
-
-    constituents = (
-        constituents
-        .dropna(subset=["Symbol"])
-        .drop_duplicates(subset=["Symbol"])
+    frame = (
+        frame
+        .dropna(subset=["CIK", "Symbol"])
+        .drop_duplicates("Symbol")
         .sort_values("Symbol")
         .reset_index(drop=True)
     )
 
-    if len(constituents) < 450:
-        raise ValueError(
-            f"Only {len(constituents)} S&P 500 constituents "
-            "were loaded. The data source may be unavailable "
-            "or incomplete."
-        )
+    return frame
 
-    return constituents
 
 # ============================================================
 # INSIDER ACTIVITY
 # ============================================================
 
-def get_insider_purchase_data(
-    ticker: yf.Ticker,
-) -> dict:
-    """
-    Estimate recent insider purchases.
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_sec_submissions(cik: int) -> dict:
+    cik_string = f"{int(cik):010d}"
 
-    Yahoo Finance transaction fields can vary by company,
-    so this intentionally treats insider buying as a signal
-    rather than a perfect accounting measure.
-    """
+    url = (
+        "https://data.sec.gov/submissions/"
+        f"CIK{cik_string}.json"
+    )
+
+    response = requests.get(
+        url,
+        headers=SEC_HEADERS,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_recent_form4_filings(
+    cik: int,
+    days: int = 90,
+) -> pd.DataFrame:
+
+    payload = get_sec_submissions(cik)
+
+    recent = payload.get(
+        "filings",
+        {},
+    ).get(
+        "recent",
+        {},
+    )
+
+    if not recent:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(recent)
+
+    if frame.empty:
+        return frame
+
+    frame["filingDate"] = pd.to_datetime(
+        frame["filingDate"],
+        errors="coerce",
+    )
+
+    cutoff = (
+        pd.Timestamp.utcnow().tz_localize(None)
+        - pd.Timedelta(days=days)
+    )
+
+    frame = frame[
+        (frame["form"] == "4")
+        & (frame["filingDate"] >= cutoff)
+    ].copy()
+
+    return frame
+
+
+def parse_form4_xml(
+    xml_text: str,
+) -> list[dict]:
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    namespace = ""
+
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}")[0] + "}"
+
+    rows = []
+
+    issuer = root.find(
+        f".//{namespace}issuer",
+    )
+
+    issuer_symbol = ""
+
+    if issuer is not None:
+        symbol_node = issuer.find(
+            f"{namespace}issuerTradingSymbol"
+        )
+
+        if symbol_node is not None:
+            issuer_symbol = (
+                symbol_node.text or ""
+            ).strip().upper()
+
+    reporting = root.find(
+        f".//{namespace}reportingOwner"
+    )
+
+    insider_name = ""
+
+    if reporting is not None:
+        name_node = reporting.find(
+            f".//{namespace}rptOwnerName"
+        )
+
+        if name_node is not None:
+            insider_name = (
+                name_node.text or ""
+            ).strip()
+
+    for transaction in root.findall(
+        f".//{namespace}nonDerivativeTable/"
+        f"{namespace}nonDerivativeTransaction"
+    ):
+
+        code_node = transaction.find(
+            f".//{namespace}transactionCoding/"
+            f"{namespace}transactionCode"
+        )
+
+        if code_node is None:
+            continue
+
+        code = (
+            code_node.text or ""
+        ).strip().upper()
+
+        date_node = transaction.find(
+            f".//{namespace}transactionDate/"
+            f"{namespace}value"
+        )
+
+        shares_node = transaction.find(
+            f".//{namespace}transactionAmounts/"
+            f"{namespace}transactionShares/"
+            f"{namespace}value"
+        )
+
+        price_node = transaction.find(
+            f".//{namespace}transactionAmounts/"
+            f"{namespace}transactionPricePerShare/"
+            f"{namespace}value"
+        )
+
+        acquired_disposed = transaction.find(
+            f".//{namespace}transactionAmounts/"
+            f"{namespace}transactionAcquiredDisposedCode/"
+            f"{namespace}value"
+        )
+
+        transaction_date = (
+            pd.to_datetime(
+                date_node.text,
+                errors="coerce",
+            )
+            if date_node is not None
+            else pd.NaT
+        )
+
+        shares = (
+            safe_float(shares_node.text)
+            if shares_node is not None
+            else np.nan
+        )
+
+        price = (
+            safe_float(price_node.text)
+            if price_node is not None
+            else np.nan
+        )
+
+        acquired = (
+            acquired_disposed is not None
+            and (
+                acquired_disposed.text or ""
+            ).upper() == "A"
+        )
+
+        if (
+            code in PURCHASE_CODES
+            and acquired
+            and pd.notna(shares)
+            and pd.notna(price)
+        ):
+
+            rows.append(
+                {
+                    "Symbol": issuer_symbol,
+                    "Insider": insider_name,
+                    "Transaction Date": transaction_date,
+                    "Code": code,
+                    "Shares": shares,
+                    "Price": price,
+                    "Value": shares * price,
+                }
+            )
+
+    return rows
+
+
+def get_insider_purchase_data(
+    cik: int,
+    market_cap: float,
+) -> dict:
 
     result = {
-        "Insider buys": 0,
-        "Insider buy value": 0.0,
-        "Recent insider purchase": False,
+        "Insider Buy Count": 0,
+        "Insider Buy Value": 0.0,
+        "Insider Buyers": 0,
+        "Insider Cluster": False,
+        "Insider Buy % Market Cap": np.nan,
+        "Insider Transactions": pd.DataFrame(),
     }
 
     try:
 
-        transactions = (
-            ticker.insider_transactions
+        filings = get_recent_form4_filings(
+            cik,
+            days=90,
         )
 
-        if (
-            transactions is None
-            or transactions.empty
-        ):
+        if filings.empty:
             return result
 
-        frame = transactions.copy()
+        purchases = []
 
-        frame.columns = [
-            str(column)
-            .strip()
-            .lower()
-            .replace(" ", "_")
-            for column in frame.columns
-        ]
+        for _, filing in filings.iterrows():
 
-        text_columns = [
-            column
-            for column in frame.columns
-            if any(
-                word in column
-                for word in [
-                    "transaction",
-                    "type",
-                    "description",
-                    "action",
-                    "text",
-                ]
+            accession = str(
+                filing["accessionNumber"]
+            ).replace(
+                "-",
+                "",
             )
-        ]
 
-        if not text_columns:
+            primary_document = str(
+                filing["primaryDocument"]
+            )
+
+            archive_url = (
+                "https://www.sec.gov/Archives/edgar/data/"
+                f"{int(cik)}/"
+                f"{accession}/"
+                f"{primary_document}"
+            )
+
+            try:
+
+                response = requests.get(
+                    archive_url,
+                    headers=SEC_HEADERS,
+                    timeout=20,
+                )
+
+                if response.status_code != 200:
+                    continue
+
+                xml_rows = parse_form4_xml(
+                    response.text
+                )
+
+                purchases.extend(xml_rows)
+
+            except Exception:
+                continue
+
+            time.sleep(0.12)
+
+        if not purchases:
             return result
 
-        text = (
-            frame[text_columns]
-            .astype(str)
-            .agg(" ".join, axis=1)
-            .str.lower()
+        purchases = pd.DataFrame(
+            purchases
         )
 
-        purchase_mask = (
-            text.str.contains(
-                r"purchase|buy",
-                regex=True,
-                na=False,
-            )
-            & ~text.str.contains(
-                r"sale|sell",
-                regex=True,
-                na=False,
+        purchases["Transaction Date"] = (
+            pd.to_datetime(
+                purchases["Transaction Date"],
+                errors="coerce",
             )
         )
 
-        purchases = frame.loc[
-            purchase_mask
-        ]
+        purchases = purchases.dropna(
+            subset=["Transaction Date"]
+        )
 
         if purchases.empty:
             return result
 
-        result["Insider buys"] = int(
+        result[
+            "Insider Transactions"
+        ] = purchases
+
+        result["Insider Buy Count"] = int(
             len(purchases)
         )
 
-        result[
-            "Recent insider purchase"
-        ] = True
+        result["Insider Buy Value"] = float(
+            purchases["Value"].sum()
+        )
 
-        value_columns = [
-            column
-            for column in frame.columns
-            if any(
-                word in column
-                for word in [
-                    "value",
-                    "transaction_value",
-                    "total_value",
-                ]
+        result["Insider Buyers"] = int(
+            purchases["Insider"].nunique()
+        )
+
+        result["Insider Cluster"] = (
+            result["Insider Buyers"] >= 2
+        )
+
+        if (
+            pd.notna(market_cap)
+            and market_cap > 0
+        ):
+
+            result[
+                "Insider Buy % Market Cap"
+            ] = (
+                result["Insider Buy Value"]
+                / market_cap
             )
-        ]
-
-        if value_columns:
-
-            values = pd.to_numeric(
-                purchases[
-                    value_columns[0]
-                ],
-                errors="coerce",
-            ).dropna()
-
-            if not values.empty:
-                result[
-                    "Insider buy value"
-                ] = float(
-                    values.sum()
-                )
 
     except Exception:
         pass
 
     return result
+
+
+
+
+
+
+
+
+
+
+def finnhub_get(
+    endpoint: str,
+    params: Optional[dict] = None,
+) -> Optional[object]:
+
+    if not FINNHUB_API_KEY:
+        return None
+
+    params = dict(params or {})
+    params["token"] = FINNHUB_API_KEY
+
+    try:
+
+        response = requests.get(
+            f"{FINNHUB_BASE}/{endpoint}",
+            params=params,
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return None
+
+        return response.json()
+
+    except Exception:
+        return None
+
+
+def get_analyst_data(
+    symbol: str,
+) -> dict:
+
+    result = {
+        "Analyst Rating": "",
+        "Buy %": np.nan,
+        "Sell %": np.nan,
+        "Buy % YoY": np.nan,
+        "Sell % YoY": np.nan,
+        "Target Price": np.nan,
+        "Target Price YoY": np.nan,
+        "Analyst Count": np.nan,
+    }
+
+    recommendations = finnhub_get(
+        "stock/recommendation",
+        {"symbol": symbol},
+    )
+
+    if isinstance(
+        recommendations,
+        list,
+    ) and recommendations:
+
+        frame = pd.DataFrame(
+            recommendations
+        )
+
+        frame["period"] = pd.to_datetime(
+            frame["period"],
+            errors="coerce",
+        )
+
+        frame = frame.sort_values(
+            "period"
+        ).dropna(
+            subset=["period"]
+        )
+
+        if not frame.empty:
+
+            latest = frame.iloc[-1]
+
+            total = (
+                latest.get("buy", 0)
+                + latest.get("strongBuy", 0)
+                + latest.get("hold", 0)
+                + latest.get("sell", 0)
+                + latest.get("strongSell", 0)
+            )
+
+            if total > 0:
+
+                buy_count = (
+                    latest.get("buy", 0)
+                    + latest.get(
+                        "strongBuy",
+                        0,
+                    )
+                )
+
+                sell_count = (
+                    latest.get("sell", 0)
+                    + latest.get(
+                        "strongSell",
+                        0,
+                    )
+                )
+
+                result["Buy %"] = (
+                    buy_count / total
+                )
+
+                result["Sell %"] = (
+                    sell_count / total
+                )
+
+                result[
+                    "Analyst Count"
+                ] = total
+
+                if (
+                    buy_count / total
+                    >= 0.50
+                ):
+                    result[
+                        "Analyst Rating"
+                    ] = "Buy"
+
+                elif (
+                    sell_count / total
+                    >= 0.50
+                ):
+                    result[
+                        "Analyst Rating"
+                    ] = "Sell"
+
+                else:
+                    result[
+                        "Analyst Rating"
+                    ] = "Hold"
+
+            # Approximately 12 months earlier.
+            target_date = (
+                latest["period"]
+                - pd.DateOffset(months=12)
+            )
+
+            prior_idx = (
+                frame["period"]
+                - target_date
+            ).abs().idxmin()
+
+            prior = frame.loc[
+                prior_idx
+            ]
+
+            prior_total = (
+                prior.get("buy", 0)
+                + prior.get("strongBuy", 0)
+                + prior.get("hold", 0)
+                + prior.get("sell", 0)
+                + prior.get("strongSell", 0)
+            )
+
+            if prior_total > 0:
+
+                prior_buy = (
+                    prior.get("buy", 0)
+                    + prior.get(
+                        "strongBuy",
+                        0,
+                    )
+                )
+
+                prior_sell = (
+                    prior.get("sell", 0)
+                    + prior.get(
+                        "strongSell",
+                        0,
+                    )
+                )
+
+                result["Buy % YoY"] = (
+                    result["Buy %"]
+                    - prior_buy / prior_total
+                )
+
+                result["Sell % YoY"] = (
+                    result["Sell %"]
+                    - prior_sell / prior_total
+                )
+
+    target = finnhub_get(
+        "stock/price-target",
+        {"symbol": symbol},
+    )
+
+    if isinstance(target, dict):
+
+        target_mean = safe_float(
+            target.get("targetMean")
+        )
+
+        result[
+            "Target Price"
+        ] = target_mean
+
+        result[
+            "Analyst Count"
+        ] = safe_float(
+            target.get("numberAnalysts")
+        )
+
+        # Finnhub's current endpoint does not
+        # always expose historical target values.
+        #
+        # Leave this NaN rather than pretending
+        # current target data is historical data.
+
+    earnings = finnhub_get(
+        "stock/earnings",
+        {
+            "symbol": symbol,
+            "limit": 4,
+        },
+    )
+
+    if isinstance(
+        earnings,
+        list,
+    ) and earnings:
+
+        earnings_frame = pd.DataFrame(
+            earnings
+        )
+
+        result[
+            "Earnings Beats"
+        ] = int(
+            (
+                pd.to_numeric(
+                    earnings_frame["actual"],
+                    errors="coerce",
+                )
+                >
+                pd.to_numeric(
+                    earnings_frame["estimate"],
+                    errors="coerce",
+                )
+            ).sum()
+        )
+
+        result[
+            "Earnings Quarters"
+        ] = len(
+            earnings_frame
+        )
+
+    else:
+
+        result[
+            "Earnings Beats"
+        ] = np.nan
+
+        result[
+            "Earnings Quarters"
+        ] = np.nan
+
+    return result
+
+
+
+
+
+
+
+
+
+def get_institutional_data(
+    symbol: str,
+) -> dict:
+
+    result = {
+        "Institution Net Purchase": np.nan,
+        "Institution Net Value": np.nan,
+        "Institutional Buying": False,
+    }
+
+    data = finnhub_get(
+        "institutional/ownership",
+        {
+            "symbol": symbol,
+        },
+    )
+
+    if data is None:
+        return result
+
+    rows = []
+
+    if isinstance(data, dict):
+        rows = data.get(
+            "data",
+            data.get(
+                "ownership",
+                [],
+            ),
+        )
+
+    elif isinstance(data, list):
+        rows = data
+
+    if not rows:
+        return result
+
+    frame = pd.DataFrame(rows)
+
+    if frame.empty:
+        return result
+
+    if "change" in frame.columns:
+
+        changes = pd.to_numeric(
+            frame["change"],
+            errors="coerce",
+        ).dropna()
+
+        if not changes.empty:
+
+            net_purchase = float(
+                changes.sum()
+            )
+
+            result[
+                "Institution Net Purchase"
+            ] = net_purchase
+
+            result[
+                "Institutional Buying"
+            ] = (
+                net_purchase > 0
+            )
+
+    if "value" in frame.columns:
+
+        values = pd.to_numeric(
+            frame["value"],
+            errors="coerce",
+        ).dropna()
+
+        if not values.empty:
+
+            result[
+                "Institution Net Value"
+            ] = float(
+                values.sum()
+            )
+
+    return result
+
+
+
+
+
+
+
+
+def score_directional_stocks(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+
+    data = frame.copy()
+
+    # ========================================================
+    # LONG SCORE
+    # ========================================================
+
+    data["Long Revenue Score"] = np.where(
+        data["Revenue Growth YoY"] >= 0.15,
+        10,
+        0,
+    )
+
+    data["Long EPS Score"] = np.where(
+        data["EPS Growth YoY"] >= 0.15,
+        10,
+        0,
+    )
+
+    data["Long Earnings Beat Score"] = np.where(
+        data["Earnings Beat"],
+        10,
+        0,
+    )
+
+    data["Long FCF Score"] = np.where(
+        data["FCF Growth YoY"] >= 0.15,
+        10,
+        0,
+    )
+
+    data["Long Positive Margin Score"] = np.where(
+        (
+            (data["Gross Margin"] > 0)
+            & (data["Operating Margin"] > 0)
+            & (data["Net Margin"] > 0)
+        ),
+        10,
+        0,
+    )
+
+    data["Long Expanding Margin Score"] = np.where(
+        (
+            (data["Gross Margin YoY"] > 0)
+            & (data["Operating Margin YoY"] > 0)
+            & (data["Net Margin YoY"] > 0)
+        ),
+        10,
+        0,
+    )
+
+    data["Long Analyst Score"] = np.where(
+        data["Analyst Rating"].isin(
+            ["Buy", "Hold"]
+        ),
+        10,
+        0,
+    )
+
+    data["Long Buy Trend Score"] = np.where(
+        data["Buy % YoY"] > 0,
+        10,
+        0,
+    )
+
+    data["Long Target Trend Score"] = np.where(
+        data["Target Price YoY"] > 0,
+        10,
+        0,
+    )
+
+    data["Long Target Upside Score"] = np.where(
+        data["Target Upside"] >= 0.15,
+        10,
+        0,
+    )
+
+    data["Long Insider Score"] = np.where(
+        data["Insider Cluster"],
+        10,
+        0,
+    )
+
+    data["Long Institution Score"] = np.where(
+        data["Institutional Buying"],
+        10,
+        0,
+    )
+
+    long_columns = [
+        "Long Revenue Score",
+        "Long EPS Score",
+        "Long Earnings Beat Score",
+        "Long FCF Score",
+        "Long Positive Margin Score",
+        "Long Expanding Margin Score",
+        "Long Analyst Score",
+        "Long Buy Trend Score",
+        "Long Target Trend Score",
+        "Long Target Upside Score",
+        "Long Insider Score",
+        "Long Institution Score",
+    ]
+
+    data["Long Score"] = data[
+        long_columns
+    ].sum(axis=1)
+
+    # ========================================================
+    # SHORT SCORE
+    # ========================================================
+
+    data["Short Revenue Score"] = np.where(
+        data["Revenue Growth YoY"] < 0,
+        10,
+        0,
+    )
+
+    data["Short EPS Score"] = np.where(
+        data["EPS Growth YoY"] < 0,
+        10,
+        0,
+    )
+
+    data["Short Earnings Score"] = np.where(
+        ~data["Earnings Beat"],
+        10,
+        0,
+    )
+
+    data["Short FCF Score"] = np.where(
+        data["FCF Growth YoY"] < 0,
+        10,
+        0,
+    )
+
+    data["Short Positive Margin Score"] = np.where(
+        (
+            (data["Gross Margin"] < 0)
+            | (data["Operating Margin"] < 0)
+            | (data["Net Margin"] < 0)
+        ),
+        10,
+        0,
+    )
+
+    data["Short Contracting Margin Score"] = np.where(
+        (
+            (data["Gross Margin YoY"] < 0)
+            & (data["Operating Margin YoY"] < 0)
+            & (data["Net Margin YoY"] < 0)
+        ),
+        10,
+        0,
+    )
+
+    data["Short Analyst Score"] = np.where(
+        data["Analyst Rating"].isin(
+            ["Hold", "Sell"]
+        ),
+        10,
+        0,
+    )
+
+    data["Short Sell Trend Score"] = np.where(
+        data["Sell % YoY"] > 0,
+        10,
+        0,
+    )
+
+    data["Short Target Trend Score"] = np.where(
+        data["Target Price YoY"] < 0,
+        10,
+        0,
+    )
+
+    data["Short Target Downside Score"] = np.where(
+        data["Target Upside"] <= -0.15,
+        10,
+        0,
+    )
+
+    data["Short Insider Score"] = np.where(
+        ~data["Insider Cluster"],
+        10,
+        0,
+    )
+
+    data["Short Institution Score"] = np.where(
+        data["Institution Net Purchase"] < 0,
+        10,
+        0,
+    )
+
+    short_columns = [
+        "Short Revenue Score",
+        "Short EPS Score",
+        "Short Earnings Score",
+        "Short FCF Score",
+        "Short Positive Margin Score",
+        "Short Contracting Margin Score",
+        "Short Analyst Score",
+        "Short Sell Trend Score",
+        "Short Target Trend Score",
+        "Short Target Downside Score",
+        "Short Insider Score",
+        "Short Institution Score",
+    ]
+
+    data["Short Score"] = data[
+        short_columns
+    ].sum(axis=1)
+
+    return data
+
+
+
+
+
+
+
+
+
+
+def latest_yoy(
+    series: pd.Series,
+) -> float:
+
+    if series is None:
+        return np.nan
+
+    series = pd.to_numeric(
+        series,
+        errors="coerce",
+    ).dropna()
+
+    if len(series) < 2:
+        return np.nan
+
+    current = float(series.iloc[0])
+    prior = float(series.iloc[1])
+
+    if prior == 0:
+        return np.nan
+
+    return (
+        current / prior
+        - 1
+    )
+
+
+def margin_yoy(
+    income: pd.DataFrame,
+    numerator_name: str,
+) -> tuple[float, float]:
+
+    if income is None or income.empty:
+        return np.nan, np.nan
+
+    if (
+        numerator_name not in income.index
+        or "Total Revenue" not in income.index
+    ):
+        return np.nan, np.nan
+
+    revenue = pd.to_numeric(
+        income.loc["Total Revenue"],
+        errors="coerce",
+    )
+
+    numerator = pd.to_numeric(
+        income.loc[numerator_name],
+        errors="coerce",
+    )
+
+    common = pd.concat(
+        [numerator, revenue],
+        axis=1,
+    ).dropna()
+
+    if len(common) < 2:
+        return np.nan, np.nan
+
+    current_margin = (
+        common.iloc[0, 0]
+        / common.iloc[0, 1]
+    )
+
+    prior_margin = (
+        common.iloc[1, 0]
+        / common.iloc[1, 1]
+    )
+
+    return (
+        current_margin,
+        current_margin - prior_margin,
+    )
+
+
+def calculate_financial_metrics(
+    ticker: yf.Ticker,
+) -> dict:
+
+    result = {
+        "Revenue Growth YoY": np.nan,
+        "EPS Growth YoY": np.nan,
+        "FCF Growth YoY": np.nan,
+        "Gross Margin": np.nan,
+        "Operating Margin": np.nan,
+        "Net Margin": np.nan,
+        "Gross Margin YoY": np.nan,
+        "Operating Margin YoY": np.nan,
+        "Net Margin YoY": np.nan,
+    }
+
+    try:
+
+        income = ticker.income_stmt
+
+    except Exception:
+        income = pd.DataFrame()
+
+    try:
+
+        cashflow = ticker.cashflow
+
+    except Exception:
+        cashflow = pd.DataFrame()
+
+    if (
+        income is None
+        or income.empty
+    ):
+        return result
+
+    revenue = (
+        income.loc["Total Revenue"]
+        if "Total Revenue" in income.index
+        else pd.Series(dtype=float)
+    )
+
+    result[
+        "Revenue Growth YoY"
+    ] = latest_yoy(revenue)
+
+    if "Diluted EPS" in income.index:
+        result[
+            "EPS Growth YoY"
+        ] = latest_yoy(
+            income.loc["Diluted EPS"]
+        )
+
+    elif "Basic EPS" in income.index:
+        result[
+            "EPS Growth YoY"
+        ] = latest_yoy(
+            income.loc["Basic EPS"]
+        )
+
+    gross, gross_yoy = margin_yoy(
+        income,
+        "Gross Profit",
+    )
+
+    operating, operating_yoy = margin_yoy(
+        income,
+        "Operating Income",
+    )
+
+    net, net_yoy = margin_yoy(
+        income,
+        "Net Income",
+    )
+
+    result[
+        "Gross Margin"
+    ] = gross
+
+    result[
+        "Gross Margin YoY"
+    ] = gross_yoy
+
+    result[
+        "Operating Margin"
+    ] = operating
+
+    result[
+        "Operating Margin YoY"
+    ] = operating_yoy
+
+    result[
+        "Net Margin"
+    ] = net
+
+    result[
+        "Net Margin YoY"
+    ] = net_yoy
+
+    if (
+        cashflow is not None
+        and not cashflow.empty
+    ):
+
+        if (
+            "Free Cash Flow"
+            in cashflow.index
+        ):
+
+            result[
+                "FCF Growth YoY"
+            ] = latest_yoy(
+                cashflow.loc[
+                    "Free Cash Flow"
+                ]
+            )
+
+        elif (
+            "Operating Cash Flow"
+            in cashflow.index
+            and "Capital Expenditure"
+            in cashflow.index
+        ):
+
+            fcf = (
+                cashflow.loc[
+                    "Operating Cash Flow"
+                ]
+                + cashflow.loc[
+                    "Capital Expenditure"
+                ]
+            )
+
+            result[
+                "FCF Growth YoY"
+            ] = latest_yoy(fcf)
+
+    return result
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================================================
@@ -1329,9 +2444,52 @@ def get_insider_purchase_data(
 def get_stock_screen_data(
     symbol: str,
     company: str,
-    sector: str,
+    cik: int,
 ) -> dict:
-    """Download fundamental and valuation data."""
+
+    base = {
+        "Symbol": symbol,
+        "Company": company,
+        "CIK": cik,
+        "Price": np.nan,
+        "Market Cap": np.nan,
+
+        "Revenue Growth YoY": np.nan,
+        "EPS Growth YoY": np.nan,
+        "FCF Growth YoY": np.nan,
+
+        "Gross Margin": np.nan,
+        "Operating Margin": np.nan,
+        "Net Margin": np.nan,
+
+        "Gross Margin YoY": np.nan,
+        "Operating Margin YoY": np.nan,
+        "Net Margin YoY": np.nan,
+
+        "Earnings Beat": False,
+        "Earnings Beats": np.nan,
+        "Earnings Quarters": np.nan,
+
+        "Analyst Rating": "",
+        "Buy %": np.nan,
+        "Sell %": np.nan,
+        "Buy % YoY": np.nan,
+        "Sell % YoY": np.nan,
+
+        "Target Price": np.nan,
+        "Target Price YoY": np.nan,
+        "Target Upside": np.nan,
+
+        "Insider Buy Count": 0,
+        "Insider Buy Value": 0.0,
+        "Insider Buyers": 0,
+        "Insider Cluster": False,
+        "Insider Buy % Market Cap": np.nan,
+
+        "Institution Net Purchase": np.nan,
+        "Institution Net Value": np.nan,
+        "Institutional Buying": False,
+    }
 
     try:
 
@@ -1339,188 +2497,71 @@ def get_stock_screen_data(
 
         info = ticker.info or {}
 
-        current_price = safe_float(
+        base["Price"] = safe_float(
             info.get("currentPrice")
-            or info.get(
-                "regularMarketPrice"
-            )
+            or info.get("regularMarketPrice")
         )
 
-        market_cap = safe_float(
+        base["Market Cap"] = safe_float(
             info.get("marketCap")
         )
 
-        try:
-
-            fast_info = ticker.fast_info
-
-            if pd.isna(current_price):
-                current_price = safe_float(
-                    fast_info.get(
-                        "lastPrice"
-                    )
-                )
-
-            if pd.isna(market_cap):
-                market_cap = safe_float(
-                    fast_info.get(
-                        "marketCap"
-                    )
-                )
-
-        except Exception:
-            pass
-
-        target_price = safe_float(
-            info.get("targetMeanPrice")
+        financials = (
+            calculate_financial_metrics(
+                ticker
+            )
         )
 
-        upside = np.nan
+        base.update(financials)
+
+        analyst = get_analyst_data(
+            symbol
+        )
+
+        base.update(analyst)
 
         if (
-            pd.notna(current_price)
-            and current_price > 0
-            and pd.notna(target_price)
+            pd.notna(base["Target Price"])
+            and pd.notna(base["Price"])
+            and base["Price"] > 0
         ):
 
-            upside = (
-                target_price
-                / current_price
+            base["Target Upside"] = (
+                base["Target Price"]
+                / base["Price"]
                 - 1
             )
 
         insider = (
             get_insider_purchase_data(
-                ticker
+                cik,
+                base["Market Cap"],
             )
         )
 
-        return {
-            "Symbol": symbol,
-            "Company": company,
-            "Sector": sector,
-            "Industry": info.get(
-                "industry",
-                "",
-            ),
-            "Market Cap": market_cap,
+        base.update(
+            {
+                key: value
+                for key, value in insider.items()
+                if key != "Insider Transactions"
+            }
+        )
 
-            # Price / valuation
-            "Price": current_price,
-            "P/E": safe_float(
-                info.get("trailingPE")
-            ),
-            "Forward P/E": safe_float(
-                info.get("forwardPE")
-            ),
-            "PEG": safe_float(
-                info.get("pegRatio")
-            ),
-            "Price / Book": safe_float(
-                info.get("priceToBook")
-            ),
-            "EV / EBITDA": safe_float(
-                info.get(
-                    "enterpriseToEbitda"
-                )
-            ),
+        institution = (
+            get_institutional_data(
+                symbol
+            )
+        )
 
-            # Profitability
-            "ROE": safe_float(
-                info.get(
-                    "returnOnEquity"
-                )
-            ),
-            "ROA": safe_float(
-                info.get(
-                    "returnOnAssets"
-                )
-            ),
-            "Profit Margin": safe_float(
-                info.get(
-                    "profitMargins"
-                )
-            ),
-            "Operating Margin": safe_float(
-                info.get(
-                    "operatingMargins"
-                )
-            ),
-            "Gross Margin": safe_float(
-                info.get(
-                    "grossMargins"
-                )
-            ),
+        base.update(institution)
 
-            # Growth
-            "Revenue Growth": safe_float(
-                info.get(
-                    "revenueGrowth"
-                )
-            ),
-            "Earnings Growth": safe_float(
-                info.get(
-                    "earningsGrowth"
-                )
-            ),
-            "Earnings Quarterly Growth": safe_float(
-                info.get(
-                    "earningsQuarterlyGrowth"
-                )
-            ),
-
-            # Balance sheet / cash flow
-            "Debt / Equity": safe_float(
-                info.get(
-                    "debtToEquity"
-                )
-            ),
-            "Current Ratio": safe_float(
-                info.get(
-                    "currentRatio"
-                )
-            ),
-            "Free Cash Flow": safe_float(
-                info.get(
-                    "freeCashflow"
-                )
-            ),
-            "Operating Cash Flow": safe_float(
-                info.get(
-                    "operatingCashflow"
-                )
-            ),
-
-            # Analyst expectations
-            "Target Price": target_price,
-            "Upside": upside,
-            "Analyst Rating": info.get(
-                "recommendationKey",
-                "",
-            ),
-
-            # Insider activity
-            "Insider buys": insider[
-                "Insider buys"
-            ],
-            "Insider buy value": insider[
-                "Insider buy value"
-            ],
-            "Recent insider purchase": insider[
-                "Recent insider purchase"
-            ],
-        }
+        return base
 
     except Exception as exc:
 
-        return {
-            "Symbol": symbol,
-            "Company": company,
-            "Sector": sector,
-            "Industry": "",
-            "Market Cap": np.nan,
-            "Error": str(exc),
-        }
+        base["Error"] = str(exc)
+
+        return base
 
 
 # ============================================================
@@ -1531,25 +2572,24 @@ def get_stock_screen_data(
     ttl=21600,
     show_spinner=False,
 )
-def get_sp500_fundamentals(
+def get_us_stock_fundamentals(
     symbols: tuple[str, ...],
     companies: tuple[str, ...],
-    sectors: tuple[str, ...],
+    ciks: tuple[int, ...],
 ) -> pd.DataFrame:
-    """Download S&P 500 data using a small thread pool."""
-
-    records = []
 
     jobs = list(
         zip(
             symbols,
             companies,
-            sectors,
+            ciks,
         )
     )
 
+    records = []
+
     with ThreadPoolExecutor(
-        max_workers=8
+        max_workers=4
     ) as executor:
 
         futures = {
@@ -1557,9 +2597,9 @@ def get_sp500_fundamentals(
                 get_stock_screen_data,
                 symbol,
                 company,
-                sector,
+                cik,
             ): symbol
-            for symbol, company, sector
+            for symbol, company, cik
             in jobs
         }
 
@@ -1568,15 +2608,17 @@ def get_sp500_fundamentals(
         ):
 
             try:
+
                 records.append(
                     future.result()
                 )
+
             except Exception:
                 pass
 
     if not records:
         raise ValueError(
-            "No S&P 500 fundamental data was returned."
+            "No stock data was returned."
         )
 
     frame = pd.DataFrame(
@@ -1586,27 +2628,28 @@ def get_sp500_fundamentals(
     numeric_columns = [
         "Price",
         "Market Cap",
-        "P/E",
-        "Forward P/E",
-        "PEG",
-        "Price / Book",
-        "EV / EBITDA",
-        "ROE",
-        "ROA",
-        "Profit Margin",
-        "Operating Margin",
+        "Revenue Growth YoY",
+        "EPS Growth YoY",
+        "FCF Growth YoY",
         "Gross Margin",
-        "Revenue Growth",
-        "Earnings Growth",
-        "Earnings Quarterly Growth",
-        "Debt / Equity",
-        "Current Ratio",
-        "Free Cash Flow",
-        "Operating Cash Flow",
+        "Operating Margin",
+        "Net Margin",
+        "Gross Margin YoY",
+        "Operating Margin YoY",
+        "Net Margin YoY",
+        "Buy %",
+        "Sell %",
+        "Buy % YoY",
+        "Sell % YoY",
         "Target Price",
-        "Upside",
-        "Insider buys",
-        "Insider buy value",
+        "Target Price YoY",
+        "Target Upside",
+        "Insider Buy Count",
+        "Insider Buy Value",
+        "Insider Buyers",
+        "Insider Buy % Market Cap",
+        "Institution Net Purchase",
+        "Institution Net Value",
     ]
 
     for column in numeric_columns:
@@ -1619,6 +2662,340 @@ def get_sp500_fundamentals(
             )
 
     return frame
+
+
+
+
+
+
+
+
+
+def add_technical_features(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    frame = data.copy()
+
+    close = frame["Close"]
+
+    frame["EMA 8"] = (
+        close.ewm(
+            span=8,
+            adjust=False,
+        ).mean()
+    )
+
+    frame["EMA 20"] = (
+        close.ewm(
+            span=20,
+            adjust=False,
+        ).mean()
+    )
+
+    frame["EMA 200"] = (
+        close.ewm(
+            span=200,
+            adjust=False,
+        ).mean()
+    )
+
+    # 200-week EMA must be calculated from
+    # weekly closes, not approximated as SMA 1000.
+    weekly = (
+        frame["Close"]
+        .resample("W-FRI")
+        .last()
+        .dropna()
+    )
+
+    weekly_ema = (
+        weekly
+        .ewm(
+            span=200,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    frame["EMA 200 Week"] = (
+        weekly_ema
+        .reindex(
+            frame.index,
+            method="ffill",
+        )
+    )
+
+    frame["Volume Average 20"] = (
+        frame["Volume"]
+        .rolling(20)
+        .mean()
+    )
+
+    frame["Volume Ratio"] = (
+        frame["Volume"]
+        / frame["Volume Average 20"]
+    )
+
+    frame["Horizontal Support"] = (
+        frame["Low"]
+        .rolling(60)
+        .min()
+        .shift(1)
+    )
+
+    frame["Horizontal Resistance"] = (
+        frame["High"]
+        .rolling(60)
+        .max()
+        .shift(1)
+    )
+
+    return frame
+
+
+def within_one_percent(
+    price: float,
+    level: float,
+) -> bool:
+
+    if (
+        pd.isna(price)
+        or pd.isna(level)
+        or level == 0
+    ):
+        return False
+
+    return (
+        abs(price / level - 1)
+        <= 0.01
+    )
+
+
+def detect_channel(
+    data: pd.DataFrame,
+    direction: str,
+) -> bool:
+
+    if len(data) < 60:
+        return False
+
+    recent = data.tail(60).copy()
+
+    x = np.arange(
+        len(recent)
+    )
+
+    high_slope = np.polyfit(
+        x,
+        recent["High"].values,
+        1,
+    )[0]
+
+    low_slope = np.polyfit(
+        x,
+        recent["Low"].values,
+        1,
+    )[0]
+
+    price = recent["Close"].iloc[-1]
+
+    normalized_high_slope = (
+        high_slope / price
+    )
+
+    normalized_low_slope = (
+        low_slope / price
+    )
+
+    if direction == "up":
+        return (
+            normalized_high_slope > 0.0005
+            and normalized_low_slope > 0.0003
+        )
+
+    return (
+        normalized_high_slope < -0.0005
+        and normalized_low_slope < -0.0003
+    )
+
+
+def detect_wedge(
+    data: pd.DataFrame,
+    direction: str,
+) -> bool:
+
+    if len(data) < 80:
+        return False
+
+    recent = data.tail(80)
+
+    x = np.arange(
+        len(recent)
+    )
+
+    high_slope = np.polyfit(
+        x,
+        recent["High"].values,
+        1,
+    )[0]
+
+    low_slope = np.polyfit(
+        x,
+        recent["Low"].values,
+        1,
+    )[0]
+
+    spread_start = (
+        recent["High"].iloc[:20].mean()
+        - recent["Low"].iloc[:20].mean()
+    )
+
+    spread_end = (
+        recent["High"].iloc[-20:].mean()
+        - recent["Low"].iloc[-20:].mean()
+    )
+
+    contracting = (
+        spread_end < spread_start * 0.80
+    )
+
+    if not contracting:
+        return False
+
+    if direction == "up":
+        return (
+            high_slope > 0
+            and low_slope > 0
+        )
+
+    return (
+        high_slope < 0
+        and low_slope < 0
+    )
+
+
+def technical_signal(
+    data: pd.DataFrame,
+    direction: str,
+) -> dict:
+
+    frame = add_technical_features(
+        data
+    )
+
+    latest = frame.iloc[-1]
+
+    price = float(
+        latest["Close"]
+    )
+
+    ema20 = within_one_percent(
+        price,
+        latest["EMA 20"],
+    )
+
+    ema200 = within_one_percent(
+        price,
+        latest["EMA 200"],
+    )
+
+    ema200w = within_one_percent(
+        price,
+        latest["EMA 200 Week"],
+    )
+
+    if direction == "long":
+
+        horizontal = within_one_percent(
+            price,
+            latest[
+                "Horizontal Support"
+            ],
+        )
+
+        channel = detect_channel(
+            frame,
+            "up",
+        )
+
+        wedge = detect_wedge(
+            frame,
+            "up",
+        )
+
+    else:
+
+        horizontal = within_one_percent(
+            price,
+            latest[
+                "Horizontal Resistance"
+            ],
+        )
+
+        channel = detect_channel(
+            frame,
+            "down",
+        )
+
+        wedge = detect_wedge(
+            frame,
+            "down",
+        )
+
+    high_volume = (
+        latest["Volume Ratio"] >= 2.0
+    )
+
+    near_level = (
+        ema20
+        or ema200
+        or ema200w
+        or horizontal
+    )
+
+    pattern = (
+        channel
+        or wedge
+        or high_volume
+    )
+
+    return {
+        "Technical Pass": (
+            near_level
+            and pattern
+        ),
+        "Near 20 EMA": ema20,
+        "Near 200 EMA": ema200,
+        "Near 200 Week EMA": ema200w,
+        "Near Horizontal Level": horizontal,
+        "Channel Up": (
+            channel
+            if direction == "long"
+            else False
+        ),
+        "Channel Down": (
+            channel
+            if direction == "short"
+            else False
+        ),
+        "Wedge Up": (
+            wedge
+            if direction == "long"
+            else False
+        ),
+        "Wedge Down": (
+            wedge
+            if direction == "short"
+            else False
+        ),
+        "High Volume 2x": high_volume,
+        "Volume Ratio": float(
+            latest["Volume Ratio"]
+        ),
+    }
+
+
 
 
 # ============================================================
@@ -2288,62 +3665,32 @@ if "selected_screen_symbol" not in st.session_state:
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header("Signal Lab")
-
-show_screener = st.sidebar.toggle(
-    "S&P 500 Stock Screener",
-    value=True,
-    help=(
-        "Show or hide the S&P 500 "
-        "fundamental stock screener."
-    ),
-)
-
-st.sidebar.divider()
-
 st.sidebar.header(
-    "Backtest settings"
+    "Signal Screener"
 )
 
-ticker = st.sidebar.text_input(
-    "Ticker",
-    max_chars=12,
-    key="backtest_ticker",
-).strip().upper()
-
-years = st.sidebar.slider(
-    "Years of daily history",
-    1,
-    10,
-    10,
-)
-
-st.sidebar.caption(
-    "Yahoo Finance data · up to 10 years · "
-    "trades fill at the next day's open"
-)
-
-strategy_text = st.sidebar.text_area(
-    "Strategy in natural language",
-    value=(
-        "Buy when close crosses above "
-        "the 50-day SMA. Sell when close "
-        "crosses below the 50-day SMA."
-    ),
-    height=120,
+screen_direction = st.sidebar.segmented_control(
+    "Candidates",
+    options=[
+        "Both",
+        "Long",
+        "Short",
+    ],
+    default="Both",
     help=(
-        "Examples: 'Buy when RSI is below 30, "
-        "sell when RSI is above 70.' Add "
-        "'hold for 10 days', 'stop loss 5%', "
-        "or 'take profit 12%'."
+        "Long finds bullish candidates, "
+        "Short finds bearish candidates, "
+        "Both shows both lists."
     ),
 )
 
-run = st.sidebar.button(
-    "Run backtest",
-    type="primary",
-    use_container_width=True,
-)
+# If your Streamlit version does not have segmented_control, use:
+#screen_direction = st.sidebar.radio(
+#    "Candidates",
+#    ["Both", "Long", "Short"],
+#    horizontal=True,
+#)
+
 
 
 # ============================================================
@@ -2364,1073 +3711,582 @@ st.caption(
 # S&P 500 SCREENER
 # ============================================================
 
-if show_screener:
+st.header(
+    "NYSE / NASDAQ Long & Short Screener"
+)
 
-    st.header(
-        "S&P 500 Fundamental Screener"
+st.caption(
+    "Fundamental/valuation/ownership score: "
+    "120 points. Technical analysis is applied "
+    "as a second-stage filter."
+)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+
+    minimum_long_score = st.slider(
+        "Minimum Long score",
+        0,
+        120,
+        70,
+        5,
     )
 
-    st.caption(
-        "100-point score: 35 fundamental quality + "
-        "25 valuation + 25 analyst upside + "
-        "15 insider activity."
+with col2:
+
+    minimum_short_score = st.slider(
+        "Minimum Short score",
+        0,
+        120,
+        70,
+        5,
     )
 
-    with st.expander(
-        "Screener settings",
-        expanded=True,
-    ):
+with col3:
 
-        screen_columns = st.columns(4)
+    technical_lookback_years = st.slider(
+        "Technical history",
+        1,
+        5,
+        2,
+    )
 
-        with screen_columns[0]:
+run_screener = st.button(
+    "Run NYSE / NASDAQ Screener",
+    type="primary",
+    use_container_width=True,
+)
 
-            min_roe = st.slider(
-                "Minimum ROE",
-                -0.20,
-                0.50,
-                0.12,
-                0.01,
-                format="%.0f%%",
-            )
+if run_screener:
 
-            min_revenue_growth = st.slider(
-                "Minimum revenue growth",
-                -0.20,
-                0.50,
-                0.05,
-                0.01,
-                format="%.0f%%",
-            )
+    if not FINNHUB_API_KEY:
 
-        with screen_columns[1]:
-
-            min_earnings_growth = st.slider(
-                "Minimum earnings growth",
-                -0.50,
-                1.00,
-                0.05,
-                0.01,
-                format="%.0f%%",
-            )
-
-            max_debt_equity = st.slider(
-                "Maximum debt / equity",
-                0.0,
-                300.0,
-                150.0,
-                10.0,
-            )
-
-        with screen_columns[2]:
-
-            max_pe = st.slider(
-                "Maximum P/E",
-                5.0,
-                100.0,
-                30.0,
-                1.0,
-            )
-
-            max_forward_pe = st.slider(
-                "Maximum forward P/E",
-                5.0,
-                100.0,
-                25.0,
-                1.0,
-            )
-
-        with screen_columns[3]:
-
-            min_upside = st.slider(
-                "Minimum analyst upside",
-                -0.20,
-                1.00,
-                0.15,
-                0.05,
-                format="%.0f%%",
-            )
-
-            require_insider_buy = st.checkbox(
-                "Require recent insider purchase",
-                value=False,
-            )
-
-        run_screener = st.button(
-            "Run S&P 500 Screener",
-            type="primary",
-            use_container_width=True,
+        st.warning(
+            "FINNHUB_API_KEY is not configured. "
+            "The screener requires analyst/earnings/institutional "
+            "data for the full scoring model."
         )
 
-    if run_screener:
+    with st.spinner(
+        "Loading NYSE/NASDAQ universe and calculating "
+        "fundamental, analyst, insider and institutional scores..."
+    ):
 
-        with st.spinner(
-            "Downloading S&P 500 fundamentals, "
-            "valuations and insider activity..."
-        ):
+        universe = get_us_listed_universe()
+
+        # Start with a liquidity filter so that the
+        # application doesn't attempt thousands of
+        # micro-cap securities on every run.
+        #
+        # The threshold is configurable below.
+        liquidity_columns = st.columns(2)
+
+        raw = get_us_stock_fundamentals(
+            tuple(
+                universe["Symbol"]
+            ),
+            tuple(
+                universe["Company"]
+            ),
+            tuple(
+                universe["CIK"].astype(int)
+            ),
+        )
+
+        scored = score_directional_stocks(
+            raw
+        )
+
+        st.session_state[
+            "screener_raw_data"
+        ] = scored
+
+screened_data = st.session_state.get(
+    "screener_raw_data"
+)
+
+if (
+    screened_data is not None
+    and not screened_data.empty
+):
+
+    long_candidates = screened_data[
+        screened_data["Long Score"]
+        >= minimum_long_score
+    ].copy()
+
+    short_candidates = screened_data[
+        screened_data["Short Score"]
+        >= minimum_short_score
+    ].copy()
+
+    @st.cache_data(
+        ttl=3600,
+        show_spinner=False,
+    )
+    def get_technical_candidate_data(
+        symbols: tuple[str, ...],
+        years: int,
+        direction: str,
+    ) -> pd.DataFrame:
+
+        records = []
+
+        for symbol in symbols:
 
             try:
 
-                constituents = (
-                    get_sp500_constituents()
+                data = get_ohlcv(
+                    symbol,
+                    years,
                 )
 
-                raw_screen = (
-                    get_sp500_fundamentals(
-                        tuple(
-                            constituents[
-                                "Symbol"
-                            ]
-                        ),
-                        tuple(
-                            constituents[
-                                "Security"
-                            ]
-                        ),
-                        tuple(
-                            constituents[
-                                "GICS Sector"
-                            ]
-                        ),
-                    )
+                signal = technical_signal(
+                    data,
+                    direction,
                 )
 
-                screened = score_sp500_stocks(
-                    raw_screen,
-                    min_roe=min_roe,
-                    min_revenue_growth=(
-                        min_revenue_growth
-                    ),
-                    min_earnings_growth=(
-                        min_earnings_growth
-                    ),
-                    max_pe=max_pe,
-                    max_forward_pe=(
-                        max_forward_pe
-                    ),
-                    max_debt_equity=(
-                        max_debt_equity
-                    ),
-                    min_upside=min_upside,
-                    require_insider_buy=(
-                        require_insider_buy
-                    ),
+                signal["Symbol"] = symbol
+
+                records.append(
+                    signal
                 )
 
-                st.session_state[
-                    "screener_raw_data"
-                ] = raw_screen
+            except Exception:
+                continue
 
-                st.session_state[
-                    "screener_results"
-                ] = screened
-
-                if not screened.empty:
-
-                    st.session_state[
-                        "selected_screen_symbol"
-                    ] = screened.iloc[
-                        0
-                    ]["Symbol"]
-
-            except Exception as exc:
-
-                st.error(
-                    f"S&P 500 screener failed: {exc}"
-                )
-
-    raw_screen = st.session_state[
-        "screener_raw_data"
-    ]
-
-    screened = st.session_state[
-        "screener_results"
-    ]
-
-    if (
-        raw_screen is not None
-        and screened is not None
-    ):
-
-        st.write(
-            f"**{len(screened)} stocks** passed "
-            f"the current filters out of "
-            f"**{len(raw_screen)}** S&P 500 constituents."
+        return pd.DataFrame(
+            records
         )
 
-        if screened.empty:
+    if (
+        screen_direction
+        in ["Both", "Long"]
+        and not long_candidates.empty
+    ):
 
-            st.warning(
-                "No stocks passed the current criteria. "
-                "Try lowering the upside requirement "
-                "or relaxing the valuation filters."
+        long_technical = (
+            get_technical_candidate_data(
+                tuple(
+                    long_candidates["Symbol"]
+                ),
+                technical_lookback_years,
+                "long",
             )
+        )
 
-        else:
+        long_final = long_candidates.merge(
+            long_technical,
+            on="Symbol",
+            how="inner",
+        )
 
-            # ------------------------------------------------
-            # Screener summary metrics
-            # ------------------------------------------------
+        long_final = long_final[
+            long_final["Technical Pass"]
+        ].sort_values(
+            "Long Score",
+            ascending=False,
+        )
 
-            metric_columns = st.columns(5)
+    else:
 
-            metric_columns[0].metric(
-                "Stocks passing",
-                f"{len(screened):,}",
+        long_final = pd.DataFrame()
+
+    if (
+        screen_direction
+        in ["Both", "Short"]
+        and not short_candidates.empty
+    ):
+
+        short_technical = (
+            get_technical_candidate_data(
+                tuple(
+                    short_candidates["Symbol"]
+                ),
+                technical_lookback_years,
+                "short",
             )
+        )
 
-            metric_columns[1].metric(
-                "Average score",
-                f"{screened['Score'].mean():.1f}/100",
-            )
+        short_final = short_candidates.merge(
+            short_technical,
+            on="Symbol",
+            how="inner",
+        )
 
-            metric_columns[2].metric(
-                "Average upside",
-                f"{screened['Upside'].mean():+.1%}",
-            )
+        short_final = short_final[
+            short_final["Technical Pass"]
+        ].sort_values(
+            "Short Score",
+            ascending=False,
+        )
 
-            metric_columns[3].metric(
-                "Average P/E",
-                f"{screened['P/E'].mean():.1f}",
-            )
+    else:
 
-            insider_count = int(
-                (
-                    screened[
-                        "Insider buys"
-                    ].fillna(0)
-                    > 0
-                ).sum()
-            )
+        short_final = pd.DataFrame()
 
-            metric_columns[4].metric(
-                "With insider buying",
-                f"{insider_count:,}",
-            )
+def display_candidate_table(
+    frame: pd.DataFrame,
+    direction: str,
+):
 
-            # ------------------------------------------------
-            # Screener table
-            # ------------------------------------------------
+    if frame.empty:
 
-            st.subheader(
-                "Top S&P 500 candidates"
-            )
+        st.info(
+            f"No {direction.lower()} candidates "
+            "passed the current criteria."
+        )
 
-            display_screen = screened[
-                [
-                    "Symbol",
-                    "Company",
-                    "Sector",
-                    "Score",
-                    "Fundamental Score",
-                    "Valuation Score",
-                    "Upside Score",
-                    "Insider Score",
-                    "Price",
-                    "P/E",
-                    "Forward P/E",
-                    "ROE",
-                    "Revenue Growth",
-                    "Earnings Growth",
-                    "Debt / Equity",
-                    "Target Price",
-                    "Upside",
-                    "Insider buys",
-                    "Insider buy value",
-                ]
-            ].copy()
+        return
 
-            for column in [
-                "ROE",
-                "Revenue Growth",
-                "Earnings Growth",
-                "Upside",
-            ]:
+    score_column = (
+        "Long Score"
+        if direction == "Long"
+        else "Short Score"
+    )
 
-                display_screen[
-                    column
-                ] = display_screen[
-                    column
-                ].map(
-                    lambda value: (
-                        f"{value:+.1%}"
-                        if pd.notna(value)
-                        else "N/A"
-                    )
-                )
+    display_columns = [
+        "Symbol",
+        "Company",
+        score_column,
+        "Revenue Growth YoY",
+        "EPS Growth YoY",
+        "FCF Growth YoY",
+        "Gross Margin",
+        "Operating Margin",
+        "Net Margin",
+        "Analyst Rating",
+        "Buy %",
+        "Sell %",
+        "Target Price",
+        "Target Upside",
+        "Insider Buy Value",
+        "Insider Buyers",
+        "Institution Net Purchase",
+        "Volume Ratio",
+        "Near 20 EMA",
+        "Near 200 EMA",
+        "Near 200 Week EMA",
+        "Near Horizontal Level",
+        "Channel Up",
+        "Channel Down",
+        "Wedge Up",
+        "Wedge Down",
+        "High Volume 2x",
+    ]
 
-            for column in [
-                "Price",
-                "Target Price",
-                "P/E",
-                "Forward P/E",
-                "Debt / Equity",
-            ]:
+    available = [
+        column
+        for column in display_columns
+        if column in frame.columns
+    ]
 
-                display_screen[
-                    column
-                ] = display_screen[
-                    column
-                ].map(
-                    lambda value: (
-                        f"{value:.2f}"
-                        if pd.notna(value)
-                        else "N/A"
-                    )
-                )
+    display = frame[
+        available
+    ].copy()
 
-            display_screen[
-                "Insider buy value"
-            ] = display_screen[
-                "Insider buy value"
+    percent_columns = [
+        "Revenue Growth YoY",
+        "EPS Growth YoY",
+        "FCF Growth YoY",
+        "Gross Margin",
+        "Operating Margin",
+        "Net Margin",
+        "Gross Margin YoY",
+        "Operating Margin YoY",
+        "Net Margin YoY",
+        "Buy %",
+        "Sell %",
+        "Buy % YoY",
+        "Sell % YoY",
+        "Target Upside",
+        "Insider Buy % Market Cap",
+    ]
+
+    for column in percent_columns:
+
+        if column in display.columns:
+
+            display[column] = display[
+                column
             ].map(
-                lambda value: (
-                    f"${value:,.0f}"
-                    if (
-                        pd.notna(value)
-                        and value > 0
-                    )
+                lambda x: (
+                    f"{x:+.1%}"
+                    if pd.notna(x)
                     else "N/A"
                 )
             )
 
-            st.dataframe(
-                display_screen,
-                use_container_width=True,
-                hide_index=True,
-                height=600,
+    if (
+        "Insider Buy Value"
+        in display.columns
+    ):
+
+        display[
+            "Insider Buy Value"
+        ] = display[
+            "Insider Buy Value"
+        ].map(
+            lambda x: (
+                f"${x:,.0f}"
+                if pd.notna(x)
+                else "N/A"
             )
+        )
 
-            st.download_button(
-                "Download screener results CSV",
-                data=screened.to_csv(
-                    index=False
-                ).encode("utf-8"),
-                file_name=(
-                    "sp500_screener.csv"
-                ),
-                mime="text/csv",
-                use_container_width=True,
+    if (
+        "Institution Net Purchase"
+        in display.columns
+    ):
+
+        display[
+            "Institution Net Purchase"
+        ] = display[
+            "Institution Net Purchase"
+        ].map(
+            lambda x: (
+                f"{x:,.0f}"
+                if pd.notna(x)
+                else "N/A"
             )
+        )
 
-            # =================================================
-            # SELECTED STOCK
-            # =================================================
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
 
-            st.divider()
 
-            st.header(
-                "Selected Stock Analysis"
-            )
+if screen_direction == "Both":
 
-            available_symbols = (
-                screened[
-                    "Symbol"
-                ].tolist()
-            )
+    long_tab, short_tab = st.tabs(
+        [
+            "🟢 Long Candidates",
+            "🔴 Short Candidates",
+        ]
+    )
 
-            if (
-                st.session_state[
-                    "selected_screen_symbol"
-                ]
-                not in available_symbols
-            ):
+    with long_tab:
 
-                st.session_state[
-                    "selected_screen_symbol"
-                ] = available_symbols[0]
+        st.subheader(
+            f"{len(long_final)} Long candidates"
+        )
 
-            selected_symbol = st.selectbox(
-                "Select a stock to analyze",
-                available_symbols,
-                key="selected_screen_symbol",
-                format_func=lambda symbol: (
-                f"{symbol} — {screened.loc[screened['Symbol'] == symbol, 'Company'].iloc[0]}"
-                ),
-            )
+        display_candidate_table(
+            long_final,
+            "Long",
+        )
 
-            selected_row = screened[
-                screened["Symbol"]
-                == selected_symbol
-            ].iloc[0]
+    with short_tab:
 
-            st.subheader(
-                f"{selected_symbol} — "
-                f"{selected_row['Company']}"
-            )
+        st.subheader(
+            f"{len(short_final)} Short candidates"
+        )
 
-            # ------------------------------------------------
-            # Company overview
-            # ------------------------------------------------
+        display_candidate_table(
+            short_final,
+            "Short",
+        )
 
-            overview = st.columns(6)
+elif screen_direction == "Long":
 
-            overview[0].metric(
-                "Price",
-                (
-                    f"${selected_row['Price']:,.2f}"
-                    if pd.notna(
-                        selected_row["Price"]
-                    )
-                    else "N/A"
-                ),
-            )
+    st.subheader(
+        f"{len(long_final)} Long candidates"
+    )
 
-            overview[1].metric(
-                "Market Cap",
-                (
-                    f"${selected_row['Market Cap'] / 1e9:.1f}B"
-                    if pd.notna(
-                        selected_row["Market Cap"]
-                    )
-                    else "N/A"
-                ),
-            )
+    display_candidate_table(
+        long_final,
+        "Long",
+    )
 
-            overview[2].metric(
-                "P/E",
-                (
-                    f"{selected_row['P/E']:.1f}"
-                    if pd.notna(
-                        selected_row["P/E"]
-                    )
-                    else "N/A"
-                ),
-            )
+else:
 
-            overview[3].metric(
-                "ROE",
-                (
-                    f"{selected_row['ROE']:.1%}"
-                    if pd.notna(
-                        selected_row["ROE"]
-                    )
-                    else "N/A"
-                ),
-            )
+    st.subheader(
+        f"{len(short_final)} Short candidates"
+    )
 
-            overview[4].metric(
-                "Analyst upside",
-                (
-                    f"{selected_row['Upside']:+.1%}"
-                    if pd.notna(
-                        selected_row["Upside"]
-                    )
-                    else "N/A"
-                ),
-            )
+    display_candidate_table(
+        short_final,
+        "Short",
+    )
 
-            overview[5].metric(
-                "Screener score",
-                f"{selected_row['Score']:.0f}/100",
-            )
 
-            # ------------------------------------------------
-            # Fundamental snapshot
-            # ------------------------------------------------
 
-            st.markdown(
-                "#### Fundamental snapshot"
-            )
 
-            fundamental = st.columns(6)
 
-            fundamental[0].metric(
-                "Revenue growth",
-                (
-                    f"{selected_row['Revenue Growth']:+.1%}"
-                    if pd.notna(
-                        selected_row[
-                            "Revenue Growth"
-                        ]
-                    )
-                    else "N/A"
-                ),
-            )
 
-            fundamental[1].metric(
-                "Earnings growth",
-                (
-                    f"{selected_row['Earnings Growth']:+.1%}"
-                    if pd.notna(
-                        selected_row[
-                            "Earnings Growth"
-                        ]
-                    )
-                    else "N/A"
-                ),
-            )
 
-            fundamental[2].metric(
-                "Profit margin",
-                (
-                    f"{selected_row['Profit Margin']:.1%}"
-                    if pd.notna(
-                        selected_row[
-                            "Profit Margin"
-                        ]
-                    )
-                    else "N/A"
-                ),
-            )
 
-            fundamental[3].metric(
-                "Debt / Equity",
-                (
-                    f"{selected_row['Debt / Equity']:.1f}"
-                    if pd.notna(
-                        selected_row[
-                            "Debt / Equity"
-                        ]
-                    )
-                    else "N/A"
-                ),
-            )
 
-            fundamental[4].metric(
-                "Free cash flow",
-                (
-                    f"${selected_row['Free Cash Flow'] / 1e9:.2f}B"
-                    if pd.notna(
-                        selected_row[
-                            "Free Cash Flow"
-                        ]
-                    )
-                    else "N/A"
-                ),
-            )
 
-            fundamental[5].metric(
-                "Insider purchases",
-                f"{int(selected_row['Insider buys'])}"
-                if pd.notna(
-                    selected_row[
-                        "Insider buys"
+st.divider()
+
+st.header(
+    "Daily Technical Chart"
+)
+
+all_chart_symbols = sorted(
+    set(
+        (
+            long_final["Symbol"].tolist()
+            if not long_final.empty
+            else []
+        )
+        +
+        (
+            short_final["Symbol"].tolist()
+            if not short_final.empty
+            else []
+        )
+    )
+)
+
+if all_chart_symbols:
+
+    chart_symbol = st.selectbox(
+        "Chart candidate",
+        all_chart_symbols,
+    )
+
+    chart_data = get_ohlcv(
+        chart_symbol,
+        technical_lookback_years,
+    )
+
+    chart_row = screened_data[
+        screened_data["Symbol"]
+        == chart_symbol
+    ]
+
+    insider_transactions = None
+
+    if not chart_row.empty:
+
+        cik = int(
+            chart_row.iloc[0]["CIK"]
+        )
+
+        insider_data = (
+            get_insider_purchase_data(
+                cik,
+                safe_float(
+                    chart_row.iloc[0][
+                        "Market Cap"
                     ]
-                )
-                else "0",
+                ),
             )
+        )
 
-            # ------------------------------------------------
-            # Financial statements
-            # ------------------------------------------------
+        insider_transactions = (
+            insider_data[
+                "Insider Transactions"
+            ]
+        )
 
-            st.markdown(
-                "#### Financial statements"
+    chart_features = (
+        add_technical_features(
+            chart_data
+        )
+    )
+
+    long_signal = pd.Series(
+        False,
+        index=chart_features.index,
+    )
+
+    short_signal = pd.Series(
+        False,
+        index=chart_features.index,
+    )
+
+    # Long technical signal:
+    # near a major EMA/support + bullish pattern/volume.
+    long_signal = (
+        (
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 20"]
+                    - 1
+                ) <= 0.01
             )
-
-            with st.spinner(
-                f"Loading {selected_symbol} "
-                "financial statements..."
-            ):
-
-                financials = (
-                    get_selected_stock_financials(
-                        selected_symbol
-                    )
-                )
-
-            statement_tabs = st.tabs(
-                [
-                    "Income Statement",
-                    "Balance Sheet",
-                    "Cash Flow",
-                ]
+            |
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 200"]
+                    - 1
+                ) <= 0.01
             )
-
-            with statement_tabs[0]:
-
-                income = (
-                    format_financial_statement(
-                        financials["income"]
-                    )
-                )
-
-                if income.empty:
-
-                    st.info(
-                        "Income statement data unavailable."
-                    )
-
-                else:
-
-                    st.caption(
-                        "Values shown in $ millions."
-                    )
-
-                    st.dataframe(
-                        income,
-                        use_container_width=True,
-                    )
-
-            with statement_tabs[1]:
-
-                balance = (
-                    format_financial_statement(
-                        financials["balance"]
-                    )
-                )
-
-                if balance.empty:
-
-                    st.info(
-                        "Balance sheet data unavailable."
-                    )
-
-                else:
-
-                    st.caption(
-                        "Values shown in $ millions."
-                    )
-
-                    st.dataframe(
-                        balance,
-                        use_container_width=True,
-                    )
-
-            with statement_tabs[2]:
-
-                cashflow = (
-                    format_financial_statement(
-                        financials["cashflow"]
-                    )
-                )
-
-                if cashflow.empty:
-
-                    st.info(
-                        "Cash-flow statement data unavailable."
-                    )
-
-                else:
-
-                    st.caption(
-                        "Values shown in $ millions."
-                    )
-
-                    st.dataframe(
-                        cashflow,
-                        use_container_width=True,
-                    )
-
-            # ------------------------------------------------
-            # Closest peers
-            # ------------------------------------------------
-
-            st.markdown(
-                "#### Closest S&P 500 peers"
+            |
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 200 Week"]
+                    - 1
+                ) <= 0.01
             )
+        )
+        &
+        (
+            chart_features["Volume Ratio"]
+            >= 2
+        )
+    )
 
-            peers = find_closest_peers(
-                selected_symbol,
-                raw_screen,
-                number_of_peers=2,
+    short_signal = (
+        (
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 20"]
+                    - 1
+                ) <= 0.01
             )
-
-            if peers.empty:
-
-                st.info(
-                    "Unable to identify suitable peers."
-                )
-
-            else:
-
-                comparison = pd.concat(
-                    [
-                        screened[
-                            screened[
-                                "Symbol"
-                            ]
-                            == selected_symbol
-                        ],
-                        peers,
-                    ],
-                    ignore_index=True,
-                )
-
-                comparison = (
-                    comparison.drop_duplicates(
-                        subset=["Symbol"]
-                    )
-                )
-
-                comparison = (
-                    comparison.set_index(
-                        "Symbol"
-                    )
-                )
-
-                comparison = (
-                    add_peer_relative_metrics(
-                        selected_symbol,
-                        comparison,
-                    )
-                )
-
-                # ------------------------------------------------
-                # Peer-relative summary
-                # ------------------------------------------------
-
-                peer_relative_score = (
-                    comparison.loc[
-                        selected_symbol,
-                        "Peer Relative Score",
-                    ]
-                    if "Peer Relative Score"
-                    in comparison.columns
-                    else np.nan
-                )
-
-                if pd.notna(
-                    peer_relative_score
-                ):
-
-                    if peer_relative_score >= 35:
-                        relative_label = (
-                            "Strongly better than peers"
-                        )
-
-                    elif peer_relative_score >= 25:
-                        relative_label = (
-                            "Better than peers"
-                        )
-
-                    elif peer_relative_score >= 15:
-                        relative_label = (
-                            "Mixed vs peers"
-                        )
-
-                    else:
-                        relative_label = (
-                            "Weaker vs peers"
-                        )
-
-                    st.markdown(
-                        f"### Relative investment case: "
-                        f"**{relative_label}**"
-                    )
-
-                    relative_columns = (
-                        st.columns(5)
-                    )
-
-                    relative_columns[0].metric(
-                        "Peer-relative score",
-                        f"{peer_relative_score:.0f}/50",
-                    )
-
-                    for idx, metric in enumerate(
-                        [
-                            "ROE",
-                            "Revenue Growth",
-                            "P/E",
-                            "Upside",
-                        ],
-                        start=1,
-                    ):
-
-                        value = comparison.loc[
-                            selected_symbol,
-                            f"{metric} vs Peers",
-                        ]
-
-                        if pd.isna(value):
-                            formatted = "N/A"
-                        else:
-                            formatted = (
-                                f"{value:+.1%}"
-                            )
-
-                        labels = {
-                            "ROE": "ROE vs peers",
-                            "Revenue Growth": (
-                                "Growth vs peers"
-                            ),
-                            "P/E": (
-                                "P/E advantage"
-                            ),
-                            "Upside": (
-                                "Upside vs peers"
-                            ),
-                        }
-
-                        relative_columns[
-                            idx
-                        ].metric(
-                            labels[metric],
-                            formatted,
-                        )
-
-                # ------------------------------------------------
-                # Comparison table
-                # ------------------------------------------------
-
-                comparison_metrics = [
-                    ("Company", "Company"),
-                    ("Industry", "Industry"),
-                    ("Market Cap", "Market Cap"),
-
-                    ("P/E", "P/E"),
-                    (
-                        "Peer median P/E",
-                        "P/E Peer Median",
-                    ),
-                    (
-                        "P/E vs peers",
-                        "P/E vs Peers",
-                    ),
-
-                    (
-                        "Forward P/E",
-                        "Forward P/E",
-                    ),
-                    (
-                        "Peer median forward P/E",
-                        "Forward P/E Peer Median",
-                    ),
-                    (
-                        "Forward P/E vs peers",
-                        "Forward P/E vs Peers",
-                    ),
-
-                    ("PEG", "PEG"),
-                    ("EV / EBITDA", "EV / EBITDA"),
-
-                    ("ROE", "ROE"),
-                    (
-                        "Peer median ROE",
-                        "ROE Peer Median",
-                    ),
-                    (
-                        "ROE vs peers",
-                        "ROE vs Peers",
-                    ),
-
-                    (
-                        "Revenue Growth",
-                        "Revenue Growth",
-                    ),
-                    (
-                        "Peer median revenue growth",
-                        "Revenue Growth Peer Median",
-                    ),
-                    (
-                        "Revenue growth vs peers",
-                        "Revenue Growth vs Peers",
-                    ),
-
-                    (
-                        "Earnings Growth",
-                        "Earnings Growth",
-                    ),
-                    (
-                        "Peer median earnings growth",
-                        "Earnings Growth Peer Median",
-                    ),
-
-                    (
-                        "Profit Margin",
-                        "Profit Margin",
-                    ),
-                    (
-                        "Peer median profit margin",
-                        "Profit Margin Peer Median",
-                    ),
-
-                    (
-                        "Debt / Equity",
-                        "Debt / Equity",
-                    ),
-                    (
-                        "Peer median debt / equity",
-                        "Debt / Equity Peer Median",
-                    ),
-                    (
-                        "Debt / Equity vs peers",
-                        "Debt / Equity vs Peers",
-                    ),
-
-                    (
-                        "Free Cash Flow",
-                        "Free Cash Flow",
-                    ),
-
-                    (
-                        "Target Price",
-                        "Target Price",
-                    ),
-
-                    ("Upside", "Upside"),
-                    (
-                        "Peer median upside",
-                        "Upside Peer Median",
-                    ),
-                    (
-                        "Upside vs peers",
-                        "Upside vs Peers",
-                    ),
-
-                    (
-                        "Insider buys",
-                        "Insider buys",
-                    ),
-
-                    ("Score", "Score"),
-
-                    (
-                        "Peer Relative Score",
-                        "Peer Relative Score",
-                    ),
-                ]
-
-                comparison_display = pd.DataFrame(
-                    index=[
-                        label
-                        for label, _
-                        in comparison_metrics
-                    ],
-                    columns=comparison.index,
-                )
-
-                for label, column in comparison_metrics:
-
-                    if column not in comparison.columns:
-                        continue
-
-                    for symbol in comparison.index:
-
-                        value = comparison.loc[
-                            symbol,
-                            column,
-                        ]
-
-                        if pd.isna(value):
-
-                            formatted = "N/A"
-
-                        elif column == "Market Cap":
-
-                            formatted = (
-                                f"${value / 1e9:.1f}B"
-                            )
-
-                        elif column == "Free Cash Flow":
-
-                            formatted = (
-                                f"${value / 1e9:.2f}B"
-                            )
-
-                        elif column == "Target Price":
-
-                            formatted = (
-                                f"${value:,.2f}"
-                            )
-
-                        elif column == "Peer Relative Score":
-
-                            formatted = (
-                                f"{value:.0f}/50"
-                            )
-
-                        elif column == "Score":
-
-                            formatted = (
-                                f"{value:.0f}/100"
-                            )
-
-                        elif (
-                            "vs Peers"
-                            in column
-                            or "Margin"
-                            in column
-                            or "Growth"
-                            in column
-                            or column in {
-                                "ROE",
-                                "ROA",
-                                "Upside",
-                            }
-                        ):
-
-                            formatted = (
-                                f"{value:+.1%}"
-                            )
-
-                        elif column in {
-                            "P/E",
-                            "Forward P/E",
-                            "PEG",
-                            "EV / EBITDA",
-                            "Debt / Equity",
-                        }:
-
-                            formatted = (
-                                f"{value:.1f}"
-                            )
-
-                        else:
-
-                            formatted = str(
-                                value
-                            )
-
-                        comparison_display.loc[
-                            label,
-                            symbol,
-                        ] = formatted
-
-                st.dataframe(
-                    comparison_display,
-                    use_container_width=True,
-                )
-
-                peer_names = [
-                    f"{row['Symbol']} "
-                    f"({row['Company']})"
-                    for _, row
-                    in peers.iterrows()
-                ]
-
-                st.caption(
-                    "Peers selected using "
-                    "industry, sector and "
-                    "market-cap similarity: "
-                    + " | ".join(
-                        peer_names
-                    )
-                )
-
-            # ------------------------------------------------
-            # Load into backtester
-            # ------------------------------------------------
-
-            st.markdown(
-                "#### Backtest this stock"
+            |
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 200"]
+                    - 1
+                ) <= 0.01
             )
+            |
+            (
+                abs(
+                    chart_features["Close"]
+                    / chart_features["EMA 200 Week"]
+                    - 1
+                ) <= 0.01
+            )
+        )
+        &
+        (
+            chart_features["Volume Ratio"]
+            >= 2
+        )
+    )
 
-            if st.button(
-                f"Load {selected_symbol} into backtester",
-                type="primary",
-                use_container_width=True,
-            ):
+    st.plotly_chart(
+        signal_chart(
+            chart_data,
+            chart_symbol,
+            insider_transactions,
+            long_signal,
+            short_signal,
+        ),
+        use_container_width=True,
+    )
 
-                st.session_state[
-                    "backtest_ticker"
-                ] = selected_symbol
+else:
 
-                # Remove the previous result so the
-                # selected stock is actually backtested.
-                st.session_state.pop(
-                    "backtest_data",
-                    None,
-                )
+    st.info(
+        "Run the screener to populate the technical chart."
+    )
 
-                st.success(
-                    f"{selected_symbol} loaded into "
-                    "the backtester."
-                )
-
-                st.rerun()
 
 
 # ============================================================
